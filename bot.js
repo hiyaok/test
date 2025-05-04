@@ -5,7 +5,7 @@ const path = require('path');
 const ExcelJS = require('exceljs');
 
 // Initialize bot with your token
-const bot = new Telegraf('7631108529:AAFt1beI194NT_I0jXuj-MZFVGV2YZ3-HJk');
+const bot = new Telegraf('7631108529:AAGYAFr7a6eunVchHrO-G7Tl1v4yDRRXNbM');
 
 // Create data directory if it doesn't exist
 const DATA_DIR = path.join(__dirname, 'data');
@@ -510,6 +510,12 @@ bot.launch().then(() => {
   console.log('Bot started successfully!');
 }).catch(err => {
   console.error('Failed to start bot:', err);
+});
+
+// Tambahkan setelah bot.use(stage.middleware())
+bot.use((ctx, next) => {
+  console.log('Bot menerima pesan/aksi:', ctx.update);
+  return next();
 });
 
 // Enable graceful stop
