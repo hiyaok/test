@@ -6,7 +6,7 @@ const path = require('path');
 const ExcelJS = require('exceljs');
 
 // Replace with your token
-const token = '8138702651:AAGQFucl1jGqPBrij1UPuh2vwB5VB1UnyqQ';
+const token = '7631108529:AAHp0Frem726gwnwP-eFseSxB5RSXO9UVX8';
 
 // Create a bot instance
 const bot = new TelegramBot(token, { polling: true });
@@ -39,8 +39,7 @@ try {
   if (fs.existsSync(ADMINS_FILE)) {
     admins = JSON.parse(fs.readFileSync(ADMINS_FILE, 'utf8'));
   } else {
-    // Add your admin user IDs here
-    admins = [5988451717]; // Replace with your Telegram user ID
+    // Empty admins array will be filled with first user
     fs.writeFileSync(ADMINS_FILE, JSON.stringify(admins), 'utf8');
   }
 } catch (error) {
@@ -52,9 +51,23 @@ function saveUsers() {
   fs.writeFileSync(USERS_FILE, JSON.stringify(users), 'utf8');
 }
 
+// Save admins data
+function saveAdmins() {
+  fs.writeFileSync(ADMINS_FILE, JSON.stringify(admins), 'utf8');
+}
+
 // Helper function to check if user is admin
 function isAdmin(userId) {
   return admins.includes(userId);
+}
+
+// Add admin
+function addAdmin(userId) {
+  if (!isAdmin(userId)) {
+    admins.push(userId);
+    saveAdmins();
+    console.log(`Added user ${userId} as admin`);
+  }
 }
 
 // User sessions to track state
@@ -65,17 +78,32 @@ const STATE = {
   IDLE: 'IDLE',
   AWAITING_NAME: 'AWAITING_NAME',
   AWAITING_PHONE: 'AWAITING_PHONE',
-  AWAITING_RESIDENCE: 'AWAITING_RESIDENCE',
+  AWAITING_LOCATION: 'AWAITING_LOCATION',
+  AWAITING_MANUAL_LOCATION: 'AWAITING_MANUAL_LOCATION',
   AWAITING_CONFIRMATION: 'AWAITING_CONFIRMATION',
-  ADMIN_AWAITING_AD: 'ADMIN_AWAITING_AD'
+  ADMIN_AWAITING_AD: 'ADMIN_AWAITING_AD',
+  EDITING_NAME: 'EDITING_NAME',
+  EDITING_PHONE: 'EDITING_PHONE',
+  EDITING_LOCATION: 'EDITING_LOCATION'
 };
 
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-  const userId = msg.from.id.toString();
+  const userId = msg.from.id;
   
   console.log(`User ${userId} started the bot`);
+  
+  // If this is the first user, make them an admin
+  if (admins.length === 0) {
+    addAdmin(userId);
+    console.log(`First user ${userId} automatically set as admin`);
+    bot.sendMessage(
+      chatId,
+      '🎉 *Congratulations!* 🎉\n\nAs the first user, you have been automatically set as an admin of this bot.',
+      { parse_mode: 'Markdown' }
+    );
+  }
   
   // Check if user is already registered
   if (users[userId]) {
@@ -86,7 +114,8 @@ bot.onText(/\/start/, (msg) => {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '✏️ Update My Information', callback_data: 'update_info' }]
+            [{ text: '✏️ Update My Information', callback_data: 'update_info' }],
+            [{ text: '👑 Admin Panel', callback_data: 'admin_panel' }]
           ]
         }
       }
@@ -108,12 +137,66 @@ bot.onText(/\/start/, (msg) => {
   }
 });
 
-// Handle update_info button
-bot.on('callback_query', (callbackQuery) => {
-  const data = callbackQuery.data;
-  const userId = callbackQuery.from.id.toString();
-  const chatId = callbackQuery.message.chat.id;
+// Handle admin panel access
+bot.onText(/\/admin/, (msg) => {
+  const userId = msg.from.id;
+  const chatId = msg.chat.id;
   
+  console.log(`User ${userId} accessed admin panel via command`);
+  
+  // If no admins exist yet, make this user an admin
+  if (admins.length === 0) {
+    addAdmin(userId);
+    console.log(`User ${userId} automatically set as admin`);
+  }
+  
+  if (!isAdmin(userId)) {
+    return bot.sendMessage(chatId, '⛔ You are not authorized to access the admin panel.');
+  }
+  
+  showAdminPanel(chatId);
+});
+
+// Show admin panel
+function showAdminPanel(chatId) {
+  bot.sendMessage(
+    chatId,
+    '👑 *Admin Panel*\n\nSelect an option:',
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '👥 View Users', callback_data: 'admin_view_users' }],
+          [{ text: '📊 View Users as Excel', callback_data: 'admin_download_excel' }],
+          [{ text: '📣 Send Advertisement', callback_data: 'admin_send_ad' }]
+        ]
+      }
+    }
+  );
+}
+
+// Handle all callback queries
+bot.on('callback_query', async (callbackQuery) => {
+  const data = callbackQuery.data;
+  const userId = callbackQuery.from.id;
+  const chatId = callbackQuery.message.chat.id;
+  const messageId = callbackQuery.message.message_id;
+  
+  console.log(`Callback query from user ${userId}: ${data}`);
+  
+  // Admin panel access via callback
+  if (data === 'admin_panel') {
+    if (!isAdmin(userId)) {
+      bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ You are not authorized to access the admin panel.', show_alert: true });
+      return;
+    }
+    
+    showAdminPanel(chatId);
+    bot.answerCallbackQuery(callbackQuery.id);
+    return;
+  }
+  
+  // Update info
   if (data === 'update_info') {
     // Start registration process again
     userSessions[userId] = {
@@ -129,47 +212,16 @@ bot.on('callback_query', (callbackQuery) => {
       { parse_mode: 'Markdown' }
     );
     
-    // Answer callback query
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
-});
-
-// Handle admin panel
-bot.onText(/\/admin/, (msg) => {
-  const userId = msg.from.id;
-  const chatId = msg.chat.id;
-  
-  console.log(`User ${userId} accessed admin panel`);
-  
-  if (!isAdmin(userId)) {
-    return bot.sendMessage(chatId, '⛔ You are not authorized to access the admin panel.');
-  }
-  
-  bot.sendMessage(
-    chatId,
-    '👑 *Admin Panel*\n\nSelect an option:',
-    {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '👥 View Users', callback_data: 'admin_view_users' }],
-          [{ text: '📊 View Users as Excel', callback_data: 'admin_download_excel' }],
-          [{ text: '📣 Send Advertisement', callback_data: 'admin_send_ad' }]
-        ]
-      }
-    }
-  );
-});
-
-// Handle admin callbacks
-bot.on('callback_query', async (callbackQuery) => {
-  const data = callbackQuery.data;
-  const userId = callbackQuery.from.id;
-  const chatId = callbackQuery.message.chat.id;
   
   // Handle admin view users
   if (data === 'admin_view_users') {
-    if (!isAdmin(userId)) return;
+    if (!isAdmin(userId)) {
+      bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ You are not authorized to access the admin panel.', show_alert: true });
+      return;
+    }
     
     const userCount = Object.keys(users).length;
     
@@ -194,7 +246,17 @@ bot.on('callback_query', async (callbackQuery) => {
       userList += `*User ${index + 1}:*\n`;
       userList += `👤 Name: ${user.name}\n`;
       userList += `📱 Phone: ${user.phoneNumber}\n`;
-      userList += `🏙️ Residence: ${user.residence}\n`;
+      
+      // Format location based on type
+      if (user.location && user.location.latitude) {
+        userList += `📍 Location: ${user.location.latitude}, ${user.location.longitude}\n`;
+        if (user.manualLocation) {
+          userList += `🏙️ Description: ${user.manualLocation}\n`;
+        }
+      } else if (user.manualLocation) {
+        userList += `🏙️ Location: ${user.manualLocation}\n`;
+      }
+      
       userList += `📅 Registered: ${new Date(user.registeredAt).toLocaleDateString()}\n\n`;
     });
     
@@ -216,11 +278,15 @@ bot.on('callback_query', async (callbackQuery) => {
     );
     
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
   // Handle admin download excel
-  else if (data === 'admin_download_excel') {
-    if (!isAdmin(userId)) return;
+  if (data === 'admin_download_excel') {
+    if (!isAdmin(userId)) {
+      bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ You are not authorized to access the admin panel.', show_alert: true });
+      return;
+    }
     
     const userCount = Object.keys(users).length;
     
@@ -243,20 +309,26 @@ bot.on('callback_query', async (callbackQuery) => {
       { header: 'User ID', key: 'userId', width: 15 },
       { header: 'Name', key: 'name', width: 20 },
       { header: 'Phone Number', key: 'phoneNumber', width: 15 },
-      { header: 'Residence', key: 'residence', width: 20 },
+      { header: 'Latitude', key: 'latitude', width: 15 },
+      { header: 'Longitude', key: 'longitude', width: 15 },
+      { header: 'Location Description', key: 'locationDesc', width: 25 },
       { header: 'Registration Date', key: 'registeredAt', width: 20 }
     ];
     
     // Add rows
     Object.keys(users).forEach(userId => {
       const user = users[userId];
-      worksheet.addRow({
+      const row = {
         userId,
         name: user.name,
         phoneNumber: user.phoneNumber,
-        residence: user.residence,
+        latitude: user.location ? user.location.latitude : '',
+        longitude: user.location ? user.location.longitude : '',
+        locationDesc: user.manualLocation || '',
         registeredAt: user.registeredAt
-      });
+      };
+      
+      worksheet.addRow(row);
     });
     
     // Style header row
@@ -279,11 +351,15 @@ bot.on('callback_query', async (callbackQuery) => {
     }, 5000);
     
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
   // Handle admin send ad
-  else if (data === 'admin_send_ad') {
-    if (!isAdmin(userId)) return;
+  if (data === 'admin_send_ad') {
+    if (!isAdmin(userId)) {
+      bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ You are not authorized to access the admin panel.', show_alert: true });
+      return;
+    }
     
     userSessions[userId] = {
       state: STATE.ADMIN_AWAITING_AD
@@ -303,37 +379,32 @@ bot.on('callback_query', async (callbackQuery) => {
     );
     
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
   // Handle back to admin
-  else if (data === 'back_to_admin') {
-    if (!isAdmin(userId)) return;
+  if (data === 'back_to_admin') {
+    if (!isAdmin(userId)) {
+      bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ You are not authorized to access the admin panel.', show_alert: true });
+      return;
+    }
     
     if (userSessions[userId]) {
       userSessions[userId].state = STATE.IDLE;
     }
     
-    bot.sendMessage(
-      chatId,
-      '👑 *Admin Panel*\n\nSelect an option:',
-      {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '👥 View Users', callback_data: 'admin_view_users' }],
-            [{ text: '📊 View Users as Excel', callback_data: 'admin_download_excel' }],
-            [{ text: '📣 Send Advertisement', callback_data: 'admin_send_ad' }]
-          ]
-        }
-      }
-    );
+    showAdminPanel(chatId);
     
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
   // Handle send ad confirmation
-  else if (data.startsWith('send_ad:')) {
-    if (!isAdmin(userId)) return;
+  if (data.startsWith('send_ad:')) {
+    if (!isAdmin(userId)) {
+      bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ You are not authorized to access the admin panel.', show_alert: true });
+      return;
+    }
     
     const adText = Buffer.from(data.split(':')[1], 'base64').toString();
     
@@ -400,63 +471,88 @@ bot.on('callback_query', async (callbackQuery) => {
     });
     
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
+  }
+  
+  // Handle manual location entry
+  if (data === 'enter_manual_location') {
+    userSessions[userId].state = STATE.AWAITING_MANUAL_LOCATION;
+    
+    bot.sendMessage(
+      chatId,
+      '🏙️ Please enter your place of residence:',
+      {
+        reply_markup: {
+          remove_keyboard: true
+        }
+      }
+    );
+    
+    bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
   // Handle confirm_data
-  else if (data === 'confirm_data') {
+  if (data === 'confirm_data') {
     const session = userSessions[userId];
     
-    if (session && session.state === STATE.AWAITING_CONFIRMATION) {
-      const userData = session.data;
-      userData.registeredAt = new Date().toISOString();
-      
-      users[userId] = userData;
-      saveUsers();
-      
-      bot.editMessageText(
-        `✨ *Thank you!* ✨\n\nYour data has been received and saved successfully.`,
-        {
-          chat_id: chatId,
-          message_id: callbackQuery.message.message_id,
-          parse_mode: 'Markdown'
-        }
-      );
-      
-      userSessions[userId].state = STATE.IDLE;
+    if (!session || session.state !== STATE.AWAITING_CONFIRMATION) {
+      bot.answerCallbackQuery(callbackQuery.id, { text: '❌ Something went wrong. Please try again.', show_alert: true });
+      return;
     }
     
+    const userData = session.data;
+    userData.registeredAt = new Date().toISOString();
+    
+    users[userId] = userData;
+    saveUsers();
+    
+    bot.editMessageText(
+      `✨ *Thank you!* ✨\n\nYour data has been received and saved successfully.`,
+      {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: 'Markdown'
+      }
+    );
+    
+    userSessions[userId].state = STATE.IDLE;
+    
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
   // Handle edit_data
-  else if (data === 'edit_data') {
+  if (data === 'edit_data') {
     bot.sendMessage(
       chatId,
-      '🔄 Let\'s update your information. What would you like to edit?',
+      '🔄 What would you like to edit?',
       {
         reply_markup: {
           inline_keyboard: [
             [{ text: '👤 Name', callback_data: 'edit_name' }],
             [{ text: '📱 Phone Number', callback_data: 'edit_phone' }],
-            [{ text: '🏙️ Residence', callback_data: 'edit_residence' }]
+            [{ text: '📍 Location', callback_data: 'edit_location' }]
           ]
         }
       }
     );
     
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
   // Handle edit_name
-  else if (data === 'edit_name') {
-    userSessions[userId].state = STATE.AWAITING_NAME;
+  if (data === 'edit_name') {
+    userSessions[userId].state = STATE.EDITING_NAME;
     bot.sendMessage(chatId, '👤 Please enter your new name:');
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
   // Handle edit_phone
-  else if (data === 'edit_phone') {
-    userSessions[userId].state = STATE.AWAITING_PHONE;
+  if (data === 'edit_phone') {
+    userSessions[userId].state = STATE.EDITING_PHONE;
     bot.sendMessage(
       chatId,
       '📱 Please enter your new phone number:',
@@ -471,26 +567,58 @@ bot.on('callback_query', async (callbackQuery) => {
       }
     );
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
   
-  // Handle edit_residence
-  else if (data === 'edit_residence') {
-    userSessions[userId].state = STATE.AWAITING_RESIDENCE;
-    bot.sendMessage(chatId, '🏙️ Please enter your new place of residence:');
+  // Handle edit_location
+  if (data === 'edit_location') {
+    userSessions[userId].state = STATE.EDITING_LOCATION;
+    bot.sendMessage(
+      chatId,
+      '📍 Please share your location:',
+      {
+        reply_markup: {
+          keyboard: [
+            [{ text: '📍 Share my location', request_location: true }],
+            [{ text: '🏙️ Enter location manually' }]
+          ],
+          resize_keyboard: true,
+          one_time_keyboard: true
+        }
+      }
+    );
     bot.answerCallbackQuery(callbackQuery.id);
+    return;
   }
 });
 
 // Handle text messages
-bot.on('message', (msg) => {
-  if (!msg.text && !msg.contact) return;
+bot.on('message', async (msg) => {
+  // Skip processing if message doesn't contain useful data
+  if (!msg.text && !msg.contact && !msg.location) return;
   
   const chatId = msg.chat.id;
-  const userId = msg.from.id.toString();
+  const userId = msg.from.id;
   const session = userSessions[userId];
   
   // Skip commands
   if (msg.text && msg.text.startsWith('/')) return;
+  
+  // Manual location entry without going through keyboard
+  if (msg.text && msg.text === '🏙️ Enter location manually') {
+    userSessions[userId].state = STATE.AWAITING_MANUAL_LOCATION;
+    
+    bot.sendMessage(
+      chatId,
+      '🏙️ Please enter your place of residence:',
+      {
+        reply_markup: {
+          remove_keyboard: true
+        }
+      }
+    );
+    return;
+  }
   
   // If admin is sending an ad
   if (session && session.state === STATE.ADMIN_AWAITING_AD && isAdmin(userId)) {
@@ -518,104 +646,244 @@ bot.on('message', (msg) => {
   if (!session) {
     bot.sendMessage(
       chatId,
-      '❓ *I didn\'t understand that command*\n\nPlease use /start to begin or /admin for admin panel.',
+      '❓ *I didn\'t understand that*\n\nPlease use /start to begin or /admin for admin panel.',
       { parse_mode: 'Markdown' }
     );
     return;
   }
   
-  // Handle based on state
-  switch (session.state) {
-    case STATE.AWAITING_NAME:
-      if (!msg.text) {
-        bot.sendMessage(chatId, '❌ Please send a valid name as text.');
+  // Handle location
+  if (msg.location) {
+    if (session.state === STATE.AWAITING_LOCATION || session.state === STATE.EDITING_LOCATION) {
+      session.data.location = {
+        latitude: msg.location.latitude,
+        longitude: msg.location.longitude
+      };
+      
+      // If editing, update confirmation immediately
+      if (session.state === STATE.EDITING_LOCATION) {
+        showUpdatedData(chatId, userId);
         return;
       }
       
-      session.data.name = msg.text;
-      session.state = STATE.AWAITING_PHONE;
+      // Ask if they want to add a description
+      bot.sendMessage(
+        chatId,
+        '📍 Location received! Would you like to add a description of your location?',
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: 'Yes', callback_data: 'enter_manual_location' },
+                { text: 'No', callback_data: 'skip_description' }
+              ]
+            ]
+          },
+          remove_keyboard: true
+        }
+      );
+      
+      // Move to confirmation if no description needed
+      bot.on('callback_query', (callbackQuery) => {
+        if (callbackQuery.data === 'skip_description') {
+          session.state = STATE.AWAITING_CONFIRMATION;
+          bot.answerCallbackQuery(callbackQuery.id);
+          showConfirmationMessage(chatId, userId);
+        }
+      });
+    }
+    return;
+  }
+  
+  // Handle contact
+  if (msg.contact) {
+    if (session.state === STATE.AWAITING_PHONE || session.state === STATE.EDITING_PHONE) {
+      session.data.phoneNumber = msg.contact.phone_number;
+      
+      // If editing, update confirmation
+      if (session.state === STATE.EDITING_PHONE) {
+        showUpdatedData(chatId, userId);
+        return;
+      }
+      
+      // Move to next step if registering
+      session.state = STATE.AWAITING_LOCATION;
       
       bot.sendMessage(
         chatId,
-        '📱 Please share your phone number:',
+        '📍 Please share your location:',
         {
           reply_markup: {
             keyboard: [
-              [{ text: '📲 Share my phone number', request_contact: true }]
+              [{ text: '📍 Share my location', request_location: true }],
+              [{ text: '🏙️ Enter location manually' }]
             ],
             resize_keyboard: true,
             one_time_keyboard: true
           }
         }
       );
-      break;
-      
-    case STATE.AWAITING_PHONE:
-      let phoneNumber;
-      
-      if (msg.contact) {
-        phoneNumber = msg.contact.phone_number;
-      } else if (msg.text) {
-        phoneNumber = msg.text;
-      } else {
-        bot.sendMessage(chatId, '❌ Please send a valid phone number.');
-        return;
-      }
-      
-      session.data.phoneNumber = phoneNumber;
-      session.state = STATE.AWAITING_RESIDENCE;
-      
-      bot.sendMessage(
-        chatId,
-        '🏙️ Please enter your place of residence:',
-        {
-          reply_markup: {
-            remove_keyboard: true
+    }
+    return;
+  }
+  
+  // Handle text based on state
+  if (msg.text) {
+    switch (session.state) {
+      case STATE.AWAITING_NAME:
+        session.data.name = msg.text;
+        session.state = STATE.AWAITING_PHONE;
+        
+        bot.sendMessage(
+          chatId,
+          '📱 Please share your phone number:',
+          {
+            reply_markup: {
+              keyboard: [
+                [{ text: '📲 Share my phone number', request_contact: true }]
+              ],
+              resize_keyboard: true,
+              one_time_keyboard: true
+            }
           }
-        }
-      );
-      break;
-      
-    case STATE.AWAITING_RESIDENCE:
-      if (!msg.text) {
-        bot.sendMessage(chatId, '❌ Please send a valid residence as text.');
-        return;
-      }
-      
-      session.data.residence = msg.text;
-      session.state = STATE.AWAITING_CONFIRMATION;
-      
-      bot.sendMessage(
-        chatId,
-        `📋 *Your data has been received*\n\n` +
-        `👤 *Name:* ${session.data.name}\n` +
-        `📱 *Phone:* ${session.data.phoneNumber}\n` +
-        `🏙️ *Residence:* ${session.data.residence}\n\n` +
-        `Do you want to confirm?`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '✅ Confirm', callback_data: 'confirm_data' },
-                { text: '✏️ Edit', callback_data: 'edit_data' }
-              ]
-            ]
+        );
+        break;
+        
+      case STATE.AWAITING_PHONE:
+        session.data.phoneNumber = msg.text;
+        session.state = STATE.AWAITING_LOCATION;
+        
+        bot.sendMessage(
+          chatId,
+          '📍 Please share your location:',
+          {
+            reply_markup: {
+              keyboard: [
+                [{ text: '📍 Share my location', request_location: true }],
+                [{ text: '🏙️ Enter location manually' }]
+              ],
+              resize_keyboard: true,
+              one_time_keyboard: true
+            }
           }
-        }
-      );
-      break;
+        );
+        break;
+        
+      case STATE.AWAITING_MANUAL_LOCATION:
+        session.data.manualLocation = msg.text;
+        session.state = STATE.AWAITING_CONFIRMATION;
+        
+        showConfirmationMessage(chatId, userId);
+        break;
+        
+      case STATE.EDITING_NAME:
+        session.data.name = msg.text;
+        showUpdatedData(chatId, userId);
+        break;
+        
+      case STATE.EDITING_PHONE:
+        session.data.phoneNumber = msg.text;
+        showUpdatedData(chatId, userId);
+        break;
       
-    default:
-      // Unknown state, reset to IDLE
-      session.state = STATE.IDLE;
-      bot.sendMessage(
-        chatId,
-        '❓ *I didn\'t understand that command*\n\nPlease use /start to begin or /admin for admin panel.',
-        { parse_mode: 'Markdown' }
-      );
+      case STATE.EDITING_LOCATION:
+        // Manually entered location during edit
+        session.data.manualLocation = msg.text;
+        // Remove GPS coordinates if user enters manual location
+        delete session.data.location;
+        showUpdatedData(chatId, userId);
+        break;
+        
+      default:
+        // Unknown state, reset to IDLE
+        session.state = STATE.IDLE;
+        bot.sendMessage(
+          chatId,
+          '❓ *I didn\'t understand that*\n\nPlease use /start to begin registration.',
+          { 
+            parse_mode: 'Markdown',
+            reply_markup: {
+              remove_keyboard: true
+            }
+          }
+        );
+    }
   }
 });
+
+// Helper function to show confirmation message
+function showConfirmationMessage(chatId, userId) {
+  const userData = userSessions[userId].data;
+  
+  let locationInfo = '';
+  if (userData.location) {
+    locationInfo = `📍 *Location:* ${userData.location.latitude}, ${userData.location.longitude}\n`;
+    if (userData.manualLocation) {
+      locationInfo += `🏙️ *Description:* ${userData.manualLocation}\n`;
+    }
+  } else if (userData.manualLocation) {
+    locationInfo = `🏙️ *Location:* ${userData.manualLocation}\n`;
+  }
+  
+  bot.sendMessage(
+    chatId,
+    `📋 *Your data has been received*\n\n` +
+    `👤 *Name:* ${userData.name}\n` +
+    `📱 *Phone:* ${userData.phoneNumber}\n` +
+    `${locationInfo}\n` +
+    `Do you want to confirm?`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ Confirm', callback_data: 'confirm_data' },
+            { text: '✏️ Edit', callback_data: 'edit_data' }
+          ]
+        ],
+        remove_keyboard: true
+      }
+    }
+  );
+}
+
+// Helper function to show updated data
+function showUpdatedData(chatId, userId) {
+  const userData = userSessions[userId].data;
+  
+  userSessions[userId].state = STATE.AWAITING_CONFIRMATION;
+  
+  let locationInfo = '';
+  if (userData.location) {
+    locationInfo = `📍 *Location:* ${userData.location.latitude}, ${userData.location.longitude}\n`;
+    if (userData.manualLocation) {
+      locationInfo += `🏙️ *Description:* ${userData.manualLocation}\n`;
+    }
+  } else if (userData.manualLocation) {
+    locationInfo = `🏙️ *Location:* ${userData.manualLocation}\n`;
+  }
+  
+  bot.sendMessage(
+    chatId,
+    `📋 *Updated information*\n\n` +
+    `👤 *Name:* ${userData.name}\n` +
+    `📱 *Phone:* ${userData.phoneNumber}\n` +
+    `${locationInfo}\n` +
+    `Do you want to confirm?`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ Confirm', callback_data: 'confirm_data' },
+            { text: '✏️ Edit', callback_data: 'edit_data' }
+          ]
+        ],
+        remove_keyboard: true
+      }
+    }
+  );
+}
 
 // Log errors
 bot.on('polling_error', (error) => {
