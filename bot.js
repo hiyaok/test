@@ -5,11 +5,17 @@ const fs = require('fs');
 const path = require('path');
 const ExcelJS = require('exceljs');
 
+// TETAPKAN ADMIN IDS DI SINI - GANTI DENGAN ID TELEGRAM ANDA
+const ADMIN_IDS = [5988451717]; // Ganti dengan ID Telegram Anda
+
 // Replace with your token
 const token = '7631108529:AAHp0Frem726gwnwP-eFseSxB5RSXO9UVX8';
 
 // Create a bot instance
 const bot = new TelegramBot(token, { polling: true });
+
+// Log startup information
+console.log('Starting bot with admin IDs:', ADMIN_IDS);
 
 // Create data directory if it doesn't exist
 const DATA_DIR = path.join(__dirname, 'data');
@@ -19,7 +25,6 @@ if (!fs.existsSync(DATA_DIR)) {
 
 // Files to store data
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const ADMINS_FILE = path.join(DATA_DIR, 'admins.json');
 
 // Initialize or load users data
 let users = {};
@@ -33,41 +38,14 @@ try {
   console.error('Error loading users data:', error);
 }
 
-// Initialize or load admins data
-let admins = [];
-try {
-  if (fs.existsSync(ADMINS_FILE)) {
-    admins = JSON.parse(fs.readFileSync(ADMINS_FILE, 'utf8'));
-  } else {
-    // Empty admins array will be filled with first user
-    fs.writeFileSync(ADMINS_FILE, JSON.stringify(admins), 'utf8');
-  }
-} catch (error) {
-  console.error('Error loading admins data:', error);
-}
-
 // Save users data
 function saveUsers() {
   fs.writeFileSync(USERS_FILE, JSON.stringify(users), 'utf8');
 }
 
-// Save admins data
-function saveAdmins() {
-  fs.writeFileSync(ADMINS_FILE, JSON.stringify(admins), 'utf8');
-}
-
 // Helper function to check if user is admin
 function isAdmin(userId) {
-  return admins.includes(userId);
-}
-
-// Add admin
-function addAdmin(userId) {
-  if (!isAdmin(userId)) {
-    admins.push(userId);
-    saveAdmins();
-    console.log(`Added user ${userId} as admin`);
-  }
+  return ADMIN_IDS.includes(userId);
 }
 
 // User sessions to track state
@@ -94,18 +72,16 @@ bot.onText(/\/start/, (msg) => {
   
   console.log(`User ${userId} started the bot`);
   
-  // If this is the first user, make them an admin
-  if (admins.length === 0) {
-    addAdmin(userId);
-    console.log(`First user ${userId} automatically set as admin`);
-    bot.sendMessage(
-      chatId,
-      '🎉 *Congratulations!* 🎉\n\nAs the first user, you have been automatically set as an admin of this bot.',
-      { parse_mode: 'Markdown' }
-    );
+  // Check if user is admin
+  if (isAdmin(userId)) {
+    console.log(`Admin ${userId} accessed the bot`);
+    
+    // Show admin panel immediately
+    showAdminPanel(chatId);
+    return;
   }
   
-  // Check if user is already registered
+  // For non-admin users, check if already registered
   if (users[userId]) {
     bot.sendMessage(
       chatId,
@@ -114,14 +90,13 @@ bot.onText(/\/start/, (msg) => {
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '✏️ Update My Information', callback_data: 'update_info' }],
-            [{ text: '👑 Admin Panel', callback_data: 'admin_panel' }]
+            [{ text: '✏️ Update My Information', callback_data: 'update_info' }]
           ]
         }
       }
     );
   } else {
-    // Start registration process
+    // Start registration process for new non-admin users
     userSessions[userId] = {
       state: STATE.AWAITING_NAME,
       data: {
@@ -143,12 +118,6 @@ bot.onText(/\/admin/, (msg) => {
   const chatId = msg.chat.id;
   
   console.log(`User ${userId} accessed admin panel via command`);
-  
-  // If no admins exist yet, make this user an admin
-  if (admins.length === 0) {
-    addAdmin(userId);
-    console.log(`User ${userId} automatically set as admin`);
-  }
   
   if (!isAdmin(userId)) {
     return bot.sendMessage(chatId, '⛔ You are not authorized to access the admin panel.');
@@ -642,13 +611,21 @@ bot.on('message', async (msg) => {
     return;
   }
   
-  // If no active session, send help
+  // If no active session or admin with no specific task, skip processing
   if (!session) {
-    bot.sendMessage(
-      chatId,
-      '❓ *I didn\'t understand that*\n\nPlease use /start to begin or /admin for admin panel.',
-      { parse_mode: 'Markdown' }
-    );
+    // If admin, show admin panel
+    if (isAdmin(userId)) {
+      if (msg.text && !msg.text.startsWith('/')) {
+        showAdminPanel(chatId);
+      }
+    } else {
+      // For regular users with no session, send help
+      bot.sendMessage(
+        chatId,
+        '❓ *I didn\'t understand that*\n\nPlease use /start to begin registration.',
+        { parse_mode: 'Markdown' }
+      );
+    }
     return;
   }
   
@@ -795,18 +772,23 @@ bot.on('message', async (msg) => {
         break;
         
       default:
-        // Unknown state, reset to IDLE
-        session.state = STATE.IDLE;
-        bot.sendMessage(
-          chatId,
-          '❓ *I didn\'t understand that*\n\nPlease use /start to begin registration.',
-          { 
-            parse_mode: 'Markdown',
-            reply_markup: {
-              remove_keyboard: true
+        // For admin, show admin panel on any message
+        if (isAdmin(userId)) {
+          showAdminPanel(chatId);
+        } else {
+          // Unknown state for non-admin, reset to IDLE
+          session.state = STATE.IDLE;
+          bot.sendMessage(
+            chatId,
+            '❓ *I didn\'t understand that*\n\nPlease use /start to begin registration.',
+            { 
+              parse_mode: 'Markdown',
+              reply_markup: {
+                remove_keyboard: true
+              }
             }
-          }
-        );
+          );
+        }
     }
   }
 });
