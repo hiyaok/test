@@ -6,7 +6,7 @@ const path = require('path');
 const ExcelJS = require('exceljs');
 
 // TETAPKAN ADMIN IDS DI SINI - GANTI DENGAN ID TELEGRAM ANDA
-const ADMIN_IDS = [5988451717]; // Ganti dengan ID Telegram Anda
+const ADMIN_IDS = [5522120462]; // Ganti dengan ID Telegram Anda
 
 // Replace with your token
 const token = '7631108529:AAHp0Frem726gwnwP-eFseSxB5RSXO9UVX8';
