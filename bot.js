@@ -11,8 +11,8 @@ const ADMIN_IDS = [5522120462]; // Ganti dengan ID Telegram Anda
 // Replace with your token
 const token = '7631108529:AAHp0Frem726gwnwP-eFseSxB5RSXO9UVX8';
 
-// Create a bot instance
-const bot = new TelegramBot(token, { polling: true });
+// Create a bot instance with command parsing enabled
+const bot = new TelegramBot(token, { polling: true, parse_mode: 'Markdown' });
 
 // Log startup information
 console.log('Starting bot with admin IDs:', ADMIN_IDS);
@@ -68,14 +68,13 @@ const STATE = {
   ADMIN_AD_CONFIRM: 'ADMIN_AD_CONFIRM'
 };
 
-// Set bot commands
+// Set bot commands - ONLY the /start command
 bot.setMyCommands([
-  { command: '/start', description: 'Start the bot' },
-  { command: '/admin', description: 'Access admin panel (for admins only)' }
+  { command: '/start', description: 'Start the bot' }
 ]).then(() => {
-  console.log('Bot commands have been set up');
+  console.log('Bot start command has been set up');
 }).catch(error => {
-  console.error('Error setting bot commands:', error);
+  console.error('Error setting bot command:', error);
 });
 
 // Handle /start command
@@ -179,10 +178,31 @@ function showAdminMenu(chatId) {
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
+  
+  // Skip command handling in this handler - commands are handled by their specific handlers
+  if (msg.text && (msg.text === '/start' || msg.text === '/admin')) {
+    return;
+  }
+  
   const session = userSessions[userId];
   
   // If no session exists, create one
   if (!session) {
+    // For first-time users, guide them to use /start
+    if (!users[userId]) {
+      bot.sendMessage(
+        chatId,
+        '👋 Please use /start to begin using the bot.',
+        {
+          reply_markup: {
+            remove_keyboard: true
+          }
+        }
+      );
+      return;
+    }
+    
+    // For existing users or admins, create a default session
     userSessions[userId] = {
       state: STATE.IDLE
     };
@@ -194,10 +214,13 @@ bot.on('message', async (msg) => {
     } else {
       bot.sendMessage(
         chatId,
-        '❓ I didn\'t understand that. Please use /start to begin.',
+        `Welcome back, ${users[userId].name}! What would you like to do?`,
         {
           reply_markup: {
-            remove_keyboard: true
+            keyboard: [
+              ['✏️ Update My Information']
+            ],
+            resize_keyboard: true
           }
         }
       );
@@ -279,9 +302,8 @@ bot.on('message', async (msg) => {
     }
   }
   
-  // Skip if not a text message or is a command (except for media handling above)
+  // Skip if no text message at this point
   if (!msg.text) return;
-  if (msg.text.startsWith('/') && msg.text !== '/start' && msg.text !== '/admin') return;
   
   // ADMIN MENU OPTIONS
   if (isAdmin(userId)) {
@@ -530,6 +552,49 @@ bot.on('message', async (msg) => {
         );
       }
       break;
+      
+    // For IDLE or other states, provide appropriate guidance
+    case STATE.IDLE:
+      if (isAdmin(userId)) {
+        // For admin, show admin menu on any unhandled message
+        showAdminMenu(chatId);
+      } else {
+        // For regular users, show options
+        bot.sendMessage(
+          chatId,
+          'What would you like to do?',
+          {
+            reply_markup: {
+              keyboard: [
+                ['✏️ Update My Information']
+              ],
+              resize_keyboard: true
+            }
+          }
+        );
+      }
+      break;
+      
+    default:
+      // For unknown states, assume it's an IDLE state
+      userSessions[userId].state = STATE.IDLE;
+      
+      if (isAdmin(userId)) {
+        showAdminMenu(chatId);
+      } else {
+        bot.sendMessage(
+          chatId,
+          'What would you like to do?',
+          {
+            reply_markup: {
+              keyboard: [
+                ['✏️ Update My Information']
+              ],
+              resize_keyboard: true
+            }
+          }
+        );
+      }
   }
 });
 
@@ -822,14 +887,18 @@ async function sendAdvertisement(chatId, userId) {
       
       // Update status every 10 users
       if (sentCount % 10 === 0 || sentCount + failedCount === totalUsers) {
-        await bot.editMessageText(
-          `📣 *Sending advertisement...*\n\nProgress: ${sentCount + failedCount}/${totalUsers}`,
-          {
-            chat_id: chatId,
-            message_id: statusMsg.message_id,
-            parse_mode: 'Markdown'
-          }
-        );
+        try {
+          await bot.editMessageText(
+            `📣 *Sending advertisement...*\n\nProgress: ${sentCount + failedCount}/${totalUsers}`,
+            {
+              chat_id: chatId,
+              message_id: statusMsg.message_id,
+              parse_mode: 'Markdown'
+            }
+          );
+        } catch (error) {
+          console.error('Error updating status message:', error);
+        }
       }
       
       // Add a small delay to avoid hitting Telegram's rate limits
@@ -841,17 +910,32 @@ async function sendAdvertisement(chatId, userId) {
   }
   
   // Final status
-  await bot.editMessageText(
-    `📣 *Advertisement Status*\n\n` +
-    `✅ Successfully sent to: ${sentCount} users\n` +
-    `❌ Failed to send to: ${failedCount} users\n\n` +
-    `Total Users: ${totalUsers}`,
-    {
-      chat_id: chatId,
-      message_id: statusMsg.message_id,
-      parse_mode: 'Markdown'
-    }
-  );
+  try {
+    await bot.editMessageText(
+      `📣 *Advertisement Status*\n\n` +
+      `✅ Successfully sent to: ${sentCount} users\n` +
+      `❌ Failed to send to: ${failedCount} users\n\n` +
+      `Total Users: ${totalUsers}`,
+      {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+        parse_mode: 'Markdown'
+      }
+    );
+  } catch (error) {
+    console.error('Error updating final status message:', error);
+    // Send as a new message if edit fails
+    await bot.sendMessage(
+      chatId,
+      `📣 *Advertisement Status*\n\n` +
+      `✅ Successfully sent to: ${sentCount} users\n` +
+      `❌ Failed to send to: ${failedCount} users\n\n` +
+      `Total Users: ${totalUsers}`,
+      {
+        parse_mode: 'Markdown'
+      }
+    );
+  }
   
   // Show admin menu again
   showAdminMenu(chatId);
