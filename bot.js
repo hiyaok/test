@@ -63,12 +63,20 @@ const STATE = {
   AWAITING_CONFIRMATION: 'AWAITING_CONFIRMATION',
   ADMIN_MENU: 'ADMIN_MENU',
   ADMIN_VIEW_USERS: 'ADMIN_VIEW_USERS',
-  ADMIN_AD_TYPE: 'ADMIN_AD_TYPE',
-  ADMIN_AD_TEXT: 'ADMIN_AD_TEXT',
-  ADMIN_AD_MEDIA: 'ADMIN_AD_MEDIA',
+  ADMIN_AD_CONTENT: 'ADMIN_AD_CONTENT',
   ADMIN_AD_CAPTION: 'ADMIN_AD_CAPTION',
   ADMIN_AD_CONFIRM: 'ADMIN_AD_CONFIRM'
 };
+
+// Set bot commands
+bot.setMyCommands([
+  { command: '/start', description: 'Start the bot' },
+  { command: '/admin', description: 'Access admin panel (for admins only)' }
+]).then(() => {
+  console.log('Bot commands have been set up');
+}).catch(error => {
+  console.error('Error setting bot commands:', error);
+});
 
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
@@ -167,11 +175,8 @@ function showAdminMenu(chatId) {
   );
 }
 
-// Handle regular text messages
+// Handle all types of messages
 bot.on('message', async (msg) => {
-  // Skip if not a text message or is a command
-  if (!msg.text || msg.text.startsWith('/')) return;
-  
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const session = userSessions[userId];
@@ -200,6 +205,84 @@ bot.on('message', async (msg) => {
     return;
   }
   
+  // Handle contact sharing (for phone number)
+  if (msg.contact) {
+    if (session.state === STATE.AWAITING_PHONE) {
+      session.data.phoneNumber = msg.contact.phone_number;
+      session.state = STATE.AWAITING_RESIDENCE;
+      
+      bot.sendMessage(
+        chatId,
+        '🏙️ Please enter your place of residence:',
+        {
+          reply_markup: {
+            remove_keyboard: true
+          }
+        }
+      );
+      return;
+    }
+  }
+  
+  // Handle advertisement media - ALL TYPES (photo, video, document, audio, etc)
+  if (isAdmin(userId) && session.state === STATE.ADMIN_AD_CONTENT) {
+    // Determine what type of media was sent
+    let mediaType = null;
+    let fileId = null;
+    
+    if (msg.photo) {
+      mediaType = 'photo';
+      fileId = msg.photo[msg.photo.length - 1].file_id; // Get largest photo
+    } else if (msg.video) {
+      mediaType = 'video';
+      fileId = msg.video.file_id;
+    } else if (msg.document) {
+      mediaType = 'document';
+      fileId = msg.document.file_id;
+    } else if (msg.audio) {
+      mediaType = 'audio';
+      fileId = msg.audio.file_id;
+    } else if (msg.voice) {
+      mediaType = 'voice';
+      fileId = msg.voice.file_id;
+    } else if (msg.sticker) {
+      mediaType = 'sticker';
+      fileId = msg.sticker.file_id;
+    }
+    
+    // If media was detected, process it
+    if (mediaType && fileId) {
+      // Store media info
+      adminSessions[userId] = {
+        type: mediaType,
+        fileId: fileId
+      };
+      
+      // Move to caption step
+      userSessions[userId].state = STATE.ADMIN_AD_CAPTION;
+      
+      bot.sendMessage(
+        chatId,
+        '📝 *Add Caption (Optional)*\n\nPlease enter a caption for your media or click Skip Caption:',
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            keyboard: [
+              ['⏩ Skip Caption'],
+              ['⬅️ Back to Admin Menu']
+            ],
+            resize_keyboard: true
+          }
+        }
+      );
+      return;
+    }
+  }
+  
+  // Skip if not a text message or is a command (except for media handling above)
+  if (!msg.text) return;
+  if (msg.text.startsWith('/') && msg.text !== '/start' && msg.text !== '/admin') return;
+  
   // ADMIN MENU OPTIONS
   if (isAdmin(userId)) {
     // Handle admin menu options
@@ -214,19 +297,19 @@ bot.on('message', async (msg) => {
     }
     
     if (msg.text === '📣 Send Advertisement') {
-      userSessions[userId].state = STATE.ADMIN_AD_TYPE;
+      userSessions[userId].state = STATE.ADMIN_AD_CONTENT;
       
       bot.sendMessage(
         chatId,
-        '📣 *Create Advertisement*\n\nWhat type of advertisement would you like to send?',
+        '📣 *Create Advertisement*\n\n' +
+        'Please send any content you want to broadcast to all users:\n\n' +
+        '- Send a text message for a text announcement\n' +
+        '- Send a photo, video, document, sticker, audio, or voice message\n\n' +
+        'You can add a caption after uploading media.',
         {
           parse_mode: 'Markdown',
           reply_markup: {
             keyboard: [
-              ['📝 Text Message'],
-              ['🖼️ Photo'],
-              ['🎬 Video'],
-              ['📄 Document'],
               ['⬅️ Back to Admin Menu']
             ],
             resize_keyboard: true
@@ -238,56 +321,17 @@ bot.on('message', async (msg) => {
     
     if (msg.text === '🏠 Main Menu' || msg.text === '⬅️ Back to Admin Menu') {
       userSessions[userId].state = STATE.ADMIN_MENU;
+      delete adminSessions[userId]; // Clear any in-progress advertisement
       showAdminMenu(chatId);
       return;
     }
     
-    // AD TYPE SELECTION
-    if (session.state === STATE.ADMIN_AD_TYPE) {
-      if (msg.text === '📝 Text Message') {
-        userSessions[userId].state = STATE.ADMIN_AD_TEXT;
-        adminSessions[userId] = {
-          type: 'text'
-        };
-        
+    // Handle skip caption button
+    if (msg.text === '⏩ Skip Caption' && session.state === STATE.ADMIN_AD_CAPTION) {
+      if (!adminSessions[userId]) {
         bot.sendMessage(
           chatId,
-          '📝 *Enter Text Message*\n\n' +
-          'Please enter the text for your advertisement.\n\n' +
-          '*Formatting options:*\n' +
-          '- Use *bold text* for bold\n' +
-          '- Use _italic text_ for italics\n' +
-          '- Use `code` for monospace\n' +
-          '- Use ```pre-formatted``` for pre-formatted text\n' +
-          '- Use [text](URL) for links',
-          {
-            parse_mode: 'Markdown',
-            reply_markup: {
-              keyboard: [
-                ['⬅️ Back to Admin Menu']
-              ],
-              resize_keyboard: true
-            }
-          }
-        );
-        return;
-      } else if (['🖼️ Photo', '🎬 Video', '📄 Document'].includes(msg.text)) {
-        // Set state for media upload
-        userSessions[userId].state = STATE.ADMIN_AD_MEDIA;
-        
-        // Determine media type
-        let mediaType = '';
-        if (msg.text === '🖼️ Photo') mediaType = 'photo';
-        else if (msg.text === '🎬 Video') mediaType = 'video';
-        else if (msg.text === '📄 Document') mediaType = 'document';
-        
-        adminSessions[userId] = {
-          type: mediaType
-        };
-        
-        bot.sendMessage(
-          chatId,
-          `Please upload the ${mediaType} you want to send as an advertisement.`,
+          '❌ Error: No advertisement data found. Please try again.',
           {
             reply_markup: {
               keyboard: [
@@ -299,15 +343,36 @@ bot.on('message', async (msg) => {
         );
         return;
       }
-    }
-    
-    // ADVERTISEMENT TEXT
-    if (session.state === STATE.ADMIN_AD_TEXT && adminSessions[userId] && adminSessions[userId].type === 'text') {
-      // Store the text advertisement
-      adminSessions[userId].text = msg.text;
+      
+      adminSessions[userId].caption = '';
       userSessions[userId].state = STATE.ADMIN_AD_CONFIRM;
       
-      // Show preview and confirmation
+      // Show preview
+      showMediaPreview(chatId, userId);
+      return;
+    }
+    
+    // Handle advertisement caption
+    if (session.state === STATE.ADMIN_AD_CAPTION && adminSessions[userId]) {
+      adminSessions[userId].caption = msg.text;
+      userSessions[userId].state = STATE.ADMIN_AD_CONFIRM;
+      
+      // Show preview
+      showMediaPreview(chatId, userId);
+      return;
+    }
+    
+    // Handle admin advertisement content - TEXT ONLY
+    if (session.state === STATE.ADMIN_AD_CONTENT && !msg.text.startsWith('⬅️')) {
+      // Store the text advertisement
+      adminSessions[userId] = {
+        type: 'text',
+        text: msg.text
+      };
+      
+      userSessions[userId].state = STATE.ADMIN_AD_CONFIRM;
+      
+      // Show confirmation for text ad
       bot.sendMessage(
         chatId,
         `📣 *Advertisement Preview*\n\n${msg.text}`,
@@ -325,37 +390,26 @@ bot.on('message', async (msg) => {
       return;
     }
     
-    // ADVERTISEMENT CAPTION
-    if (session.state === STATE.ADMIN_AD_CAPTION && adminSessions[userId]) {
-      adminSessions[userId].caption = msg.text;
-      userSessions[userId].state = STATE.ADMIN_AD_CONFIRM;
-      
-      // Show confirmation for media advertisement
-      bot.sendMessage(
-        chatId,
-        `📣 *Advertisement with Caption*\n\nCaption: ${msg.text}\n\nReady to send?`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            keyboard: [
-              ['✅ Send Now'],
-              ['⬅️ Back to Admin Menu']
-            ],
-            resize_keyboard: true
+    // Handle send advertisement confirmation
+    if (session.state === STATE.ADMIN_AD_CONFIRM && msg.text === '✅ Send Now') {
+      if (!adminSessions[userId]) {
+        bot.sendMessage(
+          chatId,
+          '❌ Error: No advertisement data found. Please try again.',
+          {
+            reply_markup: {
+              keyboard: [
+                ['⬅️ Back to Admin Menu']
+              ],
+              resize_keyboard: true
+            }
           }
-        }
-      );
-      return;
-    }
-    
-    // SEND ADVERTISEMENT CONFIRMATION
-    if (session.state === STATE.ADMIN_AD_CONFIRM && msg.text === '✅ Send Now' && adminSessions[userId]) {
-      // Handle based on type
-      if (adminSessions[userId].type === 'text') {
-        sendTextAdvertisement(chatId, userId);
-      } else {
-        sendMediaAdvertisement(chatId, userId);
+        );
+        return;
       }
+      
+      // Send the advertisement based on type
+      sendAdvertisement(chatId, userId);
       return;
     }
   }
@@ -401,6 +455,22 @@ bot.on('message', async (msg) => {
             ],
             resize_keyboard: true,
             one_time_keyboard: true
+          }
+        }
+      );
+      break;
+      
+    case STATE.AWAITING_PHONE:
+      // Accept manually typed phone number
+      session.data.phoneNumber = msg.text;
+      session.state = STATE.AWAITING_RESIDENCE;
+      
+      bot.sendMessage(
+        chatId,
+        '🏙️ Please enter your place of residence:',
+        {
+          reply_markup: {
+            remove_keyboard: true
           }
         }
       );
@@ -461,136 +531,6 @@ bot.on('message', async (msg) => {
       }
       break;
   }
-});
-
-// Handle contact sharing for phone number
-bot.on('contact', (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const session = userSessions[userId];
-  
-  if (!session) return;
-  
-  if (session.state === STATE.AWAITING_PHONE) {
-    session.data.phoneNumber = msg.contact.phone_number;
-    session.state = STATE.AWAITING_RESIDENCE;
-    
-    bot.sendMessage(
-      chatId,
-      '🏙️ Please enter your place of residence:',
-      {
-        reply_markup: {
-          remove_keyboard: true
-        }
-      }
-    );
-  }
-});
-
-// Handle photo uploads (for admin advertisements)
-bot.on('photo', (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  
-  if (!isAdmin(userId)) return;
-  
-  const session = userSessions[userId];
-  if (!session || session.state !== STATE.ADMIN_AD_MEDIA || !adminSessions[userId] || adminSessions[userId].type !== 'photo') return;
-  
-  // Get the highest quality photo
-  const photo = msg.photo[msg.photo.length - 1];
-  adminSessions[userId].fileId = photo.file_id;
-  
-  userSessions[userId].state = STATE.ADMIN_AD_CAPTION;
-  
-  bot.sendMessage(
-    chatId,
-    '📝 Please enter a caption for your photo (or click Skip Caption):',
-    {
-      reply_markup: {
-        keyboard: [
-          ['⏩ Skip Caption'],
-          ['⬅️ Back to Admin Menu']
-        ],
-        resize_keyboard: true
-      }
-    }
-  );
-});
-
-// Handle video uploads
-bot.on('video', (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  
-  if (!isAdmin(userId)) return;
-  
-  const session = userSessions[userId];
-  if (!session || session.state !== STATE.ADMIN_AD_MEDIA || !adminSessions[userId] || adminSessions[userId].type !== 'video') return;
-  
-  adminSessions[userId].fileId = msg.video.file_id;
-  
-  userSessions[userId].state = STATE.ADMIN_AD_CAPTION;
-  
-  bot.sendMessage(
-    chatId,
-    '📝 Please enter a caption for your video (or click Skip Caption):',
-    {
-      reply_markup: {
-        keyboard: [
-          ['⏩ Skip Caption'],
-          ['⬅️ Back to Admin Menu']
-        ],
-        resize_keyboard: true
-      }
-    }
-  );
-});
-
-// Handle document uploads
-bot.on('document', (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  
-  if (!isAdmin(userId)) return;
-  
-  const session = userSessions[userId];
-  if (!session || session.state !== STATE.ADMIN_AD_MEDIA || !adminSessions[userId] || adminSessions[userId].type !== 'document') return;
-  
-  adminSessions[userId].fileId = msg.document.file_id;
-  
-  userSessions[userId].state = STATE.ADMIN_AD_CAPTION;
-  
-  bot.sendMessage(
-    chatId,
-    '📝 Please enter a caption for your document (or click Skip Caption):',
-    {
-      reply_markup: {
-        keyboard: [
-          ['⏩ Skip Caption'],
-          ['⬅️ Back to Admin Menu']
-        ],
-        resize_keyboard: true
-      }
-    }
-  );
-});
-
-// Handle skip caption
-bot.onText(/⏩ Skip Caption/, (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  
-  if (!isAdmin(userId)) return;
-  
-  const session = userSessions[userId];
-  if (!session || session.state !== STATE.ADMIN_AD_CAPTION || !adminSessions[userId]) return;
-  
-  adminSessions[userId].caption = '';
-  userSessions[userId].state = STATE.ADMIN_AD_CONFIRM;
-  
-  // Show preview for media
-  showMediaPreview(chatId, userId);
 });
 
 // Function to show confirmation with keyboard buttons
@@ -784,85 +724,31 @@ function showMediaPreview(chatId, userId) {
     case 'document':
       bot.sendDocument(chatId, adData.fileId, options);
       break;
+    case 'audio':
+      bot.sendAudio(chatId, adData.fileId, options);
+      break;
+    case 'voice':
+      bot.sendVoice(chatId, adData.fileId, options);
+      break;
+    case 'sticker':
+      // Stickers can't have captions, so adjust options
+      const stickerOptions = {
+        reply_markup: replyMarkup
+      };
+      bot.sendSticker(chatId, adData.fileId, stickerOptions);
+      
+      // If there was a caption, send it separately
+      if (adData.caption) {
+        bot.sendMessage(chatId, `*Caption:* ${adData.caption}`, {
+          parse_mode: 'Markdown'
+        });
+      }
+      break;
   }
 }
 
-// Function to send text advertisement
-async function sendTextAdvertisement(chatId, userId) {
-  if (!isAdmin(userId) || !adminSessions[userId]) return;
-  
-  const adText = adminSessions[userId].text;
-  
-  // Send status message
-  const statusMsg = await bot.sendMessage(
-    chatId,
-    '📣 *Sending advertisement...*',
-    { 
-      parse_mode: 'Markdown',
-      reply_markup: {
-        remove_keyboard: true
-      }
-    }
-  );
-  
-  let sentCount = 0;
-  let failedCount = 0;
-  const userIds = Object.keys(users);
-  const totalUsers = userIds.length;
-  
-  // Send to each user
-  for (const receiverId of userIds) {
-    try {
-      await bot.sendMessage(
-        users[receiverId].chatId,
-        `📢 *ANNOUNCEMENT*\n\n${adText}`,
-        { parse_mode: 'Markdown' }
-      );
-      sentCount++;
-      
-      // Update status every 10 users
-      if (sentCount % 10 === 0 || sentCount + failedCount === totalUsers) {
-        await bot.editMessageText(
-          `📣 *Sending advertisement...*\n\nProgress: ${sentCount + failedCount}/${totalUsers}`,
-          {
-            chat_id: chatId,
-            message_id: statusMsg.message_id,
-            parse_mode: 'Markdown'
-          }
-        );
-      }
-      
-      // Add a small delay to avoid hitting Telegram's rate limits
-      await new Promise(resolve => setTimeout(resolve, 100));
-    } catch (error) {
-      console.error(`Failed to send message to user ${receiverId}:`, error);
-      failedCount++;
-    }
-  }
-  
-  // Final status
-  await bot.editMessageText(
-    `📣 *Advertisement Status*\n\n` +
-    `✅ Successfully sent to: ${sentCount} users\n` +
-    `❌ Failed to send to: ${failedCount} users\n\n` +
-    `Total Users: ${totalUsers}`,
-    {
-      chat_id: chatId,
-      message_id: statusMsg.message_id,
-      parse_mode: 'Markdown'
-    }
-  );
-  
-  // Show admin menu again
-  showAdminMenu(chatId);
-  
-  // Clear admin session
-  delete adminSessions[userId];
-  userSessions[userId].state = STATE.ADMIN_MENU;
-}
-
-// Function to send media advertisement
-async function sendMediaAdvertisement(chatId, userId) {
+// Function to send advertisement to all users
+async function sendAdvertisement(chatId, userId) {
   if (!isAdmin(userId) || !adminSessions[userId]) return;
   
   const adData = adminSessions[userId];
@@ -887,22 +773,49 @@ async function sendMediaAdvertisement(chatId, userId) {
   // Send to each user
   for (const receiverId of userIds) {
     try {
-      const options = {
-        caption: adData.caption || undefined,
-        parse_mode: 'Markdown'
-      };
-      
-      // Send based on media type
-      switch (adData.type) {
-        case 'photo':
-          await bot.sendPhoto(users[receiverId].chatId, adData.fileId, options);
-          break;
-        case 'video':
-          await bot.sendVideo(users[receiverId].chatId, adData.fileId, options);
-          break;
-        case 'document':
-          await bot.sendDocument(users[receiverId].chatId, adData.fileId, options);
-          break;
+      if (adData.type === 'text') {
+        // Text advertisement
+        await bot.sendMessage(
+          users[receiverId].chatId,
+          `📢 *ANNOUNCEMENT*\n\n${adData.text}`,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        // Media advertisement
+        const options = {
+          caption: adData.caption || undefined,
+          parse_mode: 'Markdown'
+        };
+        
+        // Send based on media type
+        switch (adData.type) {
+          case 'photo':
+            await bot.sendPhoto(users[receiverId].chatId, adData.fileId, options);
+            break;
+          case 'video':
+            await bot.sendVideo(users[receiverId].chatId, adData.fileId, options);
+            break;
+          case 'document':
+            await bot.sendDocument(users[receiverId].chatId, adData.fileId, options);
+            break;
+          case 'audio':
+            await bot.sendAudio(users[receiverId].chatId, adData.fileId, options);
+            break;
+          case 'voice':
+            await bot.sendVoice(users[receiverId].chatId, adData.fileId, options);
+            break;
+          case 'sticker':
+            await bot.sendSticker(users[receiverId].chatId, adData.fileId);
+            // Send caption separately if exists
+            if (adData.caption) {
+              await bot.sendMessage(
+                users[receiverId].chatId,
+                adData.caption,
+                { parse_mode: 'Markdown' }
+              );
+            }
+            break;
+        }
       }
       
       sentCount++;
