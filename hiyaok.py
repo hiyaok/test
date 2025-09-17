@@ -113,7 +113,7 @@ def format_message(title, content="", buttons=None):
     return msg
 
 # Initialize Bot
-
+bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 # State Management
 user_states = {}
 
