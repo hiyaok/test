@@ -594,9 +594,10 @@ async def message_handler(event):
                 "phone_code_hash": result.phone_code_hash
             }
             
-            await event.reply(format_message("KODE OTP DIKIRIM 📩", 
-                                           f"Kode OTP udah dikirim ke **{nomor}**\n\n" +
-                                           "Kirim kode OTP yang lu terima:"))
+            await event.reply(format_message(
+                "KODE OTP DIKIRIM 📩", 
+                f"Kode OTP udah dikirim ke **{nomor}**\n\nKirim kode OTP yang lu terima:"
+            ))
         except Exception as e:
             await event.reply(f"❌ **Error:** {str(e)}")
             del user_states[user_id]
@@ -676,22 +677,21 @@ async def message_handler(event):
             contact_data = {
                 "phone": event.message.contact.phone_number,
                 "first_name": event.message.contact.first_name,
-                "last_name": event.contact_data = {
-                "phone": event.message.contact.phone_number,
-                "first_name": event.message.contact.first_name,
                 "last_name": event.message.contact.last_name
             }
             state["contacts"].append(contact_data)
             
             count = len(state["contacts"])
-            await event.reply(f"✅ **Kontak ke-{count} berhasil ditambahin!**\n\n" +
-                            f"👤 **Nama:** {contact_data['first_name']} {contact_data['last_name'] or ''}\n" +
-                            f"📞 **Nomor:** +{contact_data['phone']}\n\n" +
-                            "Kirim kontak lain atau ketik `/done` kalo udah selesai.")
+            await event.reply(
+                f"✅ **Kontak ke-{count} berhasil ditambahin!**\n\n"
+                f"👤 **Nama:** {contact_data['first_name']} {contact_data['last_name'] or ''}\n"
+                f"📞 **Nomor:** +{contact_data['phone']}\n\n"
+                "Kirim kontak lain atau ketik `/done` kalo udah selesai."
+            )
         else:
             await event.reply("❌ **Kirim kontak yang valid!** Bukan text biasa.")
     
-    # Handle other states...
+    # Handle Tambah Admin
     elif state["action"] == "tambah_admin":
         if event.forward and event.forward.from_id:
             new_admin_id = event.forward.from_id.user_id
@@ -758,11 +758,11 @@ async def message_handler(event):
         old_name = state["old_name"]
         
         if update_kategori(kategori_id, nama_baru):
-            buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
-            msg = format_message("NAMA KATEGORI BERHASIL DIUBAH! ✅", 
-                               f"**Nama lama:** {old_name}\n" +
-                               f"**Nama baru:** {nama_baru}")
-            
+            buttons = [[Button.inline("🔙 Kembali ke Menu Admin", b"main_admin_menu")]]
+            msg = format_message(
+                "NAMA KATEGORI BERHASIL DIUBAH! ✅", 
+                f"**Nama lama:** {old_name}\n**Nama baru:** {nama_baru}"
+            )
             await event.reply(msg, buttons=buttons)
         else:
             await event.reply("❌ **Nama kategori udah ada!** Pake nama yang lain.")
@@ -811,8 +811,10 @@ async def message_handler(event):
             success_count = 0
             total_count = len(contacts.users)
             
-            msg_status = await event.reply(format_message("PROSES INVITE... ⏳", 
-                                         f"Mulai invite {total_count} kontak ke grup/channel..."))
+            msg_status = await event.reply(format_message(
+                "PROSES INVITE... ⏳", 
+                f"Mulai invite {total_count} kontak ke grup/channel..."
+            ))
             
             for i, user in enumerate(contacts.users):
                 try:
@@ -825,28 +827,30 @@ async def message_handler(event):
                     
                     # Update progress every 10 invites
                     if (i + 1) % 10 == 0:
-                        progress_msg = format_message("PROSES INVITE... ⏳", 
-                                                    f"Progress: {i + 1}/{total_count}\n" +
-                                                    f"Berhasil: {success_count}")
+                        progress_msg = format_message(
+                            "PROSES INVITE... ⏳", 
+                            f"Progress: {i + 1}/{total_count}\nBerhasil: {success_count}"
+                        )
                         await msg_status.edit(progress_msg)
                         
                         # Add delay to avoid flood limits
                         await asyncio.sleep(2)
                 
-                except Exception as e:
+                except Exception:
                     # Skip users that can't be added
                     continue
             
             await client.disconnect()
             
             # Final result
-            buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
-            msg = format_message("INVITE SELESAI! 🎉", 
-                               f"**Akun:** {nomor}\n" +
-                               f"**Target:** {target_entity.title if hasattr(target_entity, 'title') else grup_input}\n" +
-                               f"**Berhasil di-invite:** {success_count}/{total_count} kontak\n\n" +
-                               "Proses invite sudah selesai!")
-            
+            buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
+            msg = format_message(
+                "INVITE SELESAI! 🎉", 
+                f"**Akun:** {nomor}\n"
+                f"**Target:** {target_entity.title if hasattr(target_entity, 'title') else grup_input}\n"
+                f"**Berhasil di-invite:** {success_count}/{total_count} kontak\n\n"
+                "Proses invite sudah selesai!"
+            )
             await msg_status.edit(msg, buttons=buttons)
             
         except Exception as e:
