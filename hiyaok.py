@@ -1798,27 +1798,27 @@ def cleanup_old_backups(keep_days=7):
 # Entry Point
 if __name__ == '__main__':
     try:
-        # Set event loop policy untuk Linux
+        # Set event loop policy untuk Linux (hindari konflik Telethon)
         if os.name != 'nt':  # Bukan Windows
             asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-        
+
         # Run health check
         print("🏥 Menjalankan health check...")
         if not health_check():
             print("❌ Health check gagal! Memperbaiki struktur data...")
             storage = JSONStorage()  # Reinitialize
-        
+
         # Create backup
         print("💾 Membuat backup...")
         create_backup()
-        
+
         # Cleanup old backups
         print("🧹 Membersihkan backup lama...")
         cleanup_old_backups()
-        
-        # ✅ Run bot pakai loop dari Telethon, bukan asyncio.run()
+
+        # ✅ Run bot pakai loop Telethon langsung
         bot.loop.run_until_complete(main())
-        
+
     except KeyboardInterrupt:
         print("\n💤 Bot dihentikan oleh user")
     except Exception as e:
