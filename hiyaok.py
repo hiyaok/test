@@ -20,11 +20,14 @@ BOT_TOKEN = "8426128734:AAHYVpJCy7LrofTI3AzyUNhB_42hQnVNwiA"  # Ganti dengan Bot
 ADMIN_UTAMA = 5988451717  # Ganti dengan user ID admin utama
 ADMIN_BOTS = []  # List admin bot
 
-# Database Setup
+# 🔹 Global connection, dipakai semua fungsi
+conn = sqlite3.connect("bot_data.db", check_same_thread=False, timeout=30)
+cursor = conn.cursor()
+
 def init_db():
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    
+    # Set WAL mode (lebih aman buat async)
+    cursor.execute("PRAGMA journal_mode=WAL;")
+
     # Tabel kategori
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS kategori (
@@ -33,7 +36,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
+
     # Tabel akun telegram
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS akun_tg (
@@ -46,7 +49,7 @@ def init_db():
             FOREIGN KEY (kategori_id) REFERENCES kategori (id)
         )
     ''')
-    
+
     # Tabel kontak sementara
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS temp_contacts (
@@ -55,7 +58,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
+
     # Tabel admin
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS admin_bots (
@@ -64,9 +67,8 @@ def init_db():
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    
-    conn.commit()
-    conn.close()
+
+    conn.commit()  # ✅ jangan close di sini
 
 # Helper Functions
 def is_admin_utama(user_id):
