@@ -12,8 +12,8 @@ from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
 
 # Konfigurasi Bot
-API_ID = "27020685"  # Ganti dengan API ID Anda
-API_HASH = "28fd64d3019de1741e32d77433d9354a"  # Ganti dengan API Hash Anda
+API_ID = "20755791"  # Ganti dengan API ID Anda
+API_HASH = "3d09356fe14a31a5baaad296a1abef80"  # Ganti dengan API Hash Anda
 BOT_TOKEN = "8426128734:AAHYVpJCy7LrofTI3AzyUNhB_42hQnVNwiA"  # Ganti dengan Bot Token Anda
 
 # Admin Configuration
@@ -113,7 +113,7 @@ def format_message(title, content="", buttons=None):
     return msg
 
 # Initialize Bot
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+bot = None
 
 # State Management
 user_states = {}
@@ -1590,6 +1590,8 @@ async def error_handler(event):
 
 # Run Bot
 async def main():
+    global bot
+    
     print("🤖 Bot Telegram Manager dimulai...")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
@@ -1597,15 +1599,34 @@ async def main():
     init_db()
     print("✅ Database berhasil diinisialisasi")
     
-    # Start bot
-    print(f"✅ Bot berhasil login sebagai @{(await bot.get_me()).username}")
-    print("🚀 Bot siap digunakan!")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    
-    await bot.run_until_disconnected()
+    # Initialize bot dengan proper error handling
+    try:
+        bot = TelegramClient('bot_session', API_ID, API_HASH)
+        await bot.start(bot_token=BOT_TOKEN)
+        
+        me = await bot.get_me()
+        print(f"✅ Bot berhasil login sebagai @{me.username}")
+        print("🚀 Bot siap digunakan!")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+        # Keep bot running
+        await bot.run_until_disconnected()
+        
+    except Exception as e:
+        print(f"❌ Error saat inisialisasi bot: {e}")
+        if bot:
+            await bot.disconnect()
+        return
+    finally:
+        if bot and bot.is_connected():
+            await bot.disconnect()
 
 if __name__ == '__main__':
     try:
+        # Set event loop policy untuk Linux
+        if os.name != 'nt':  # Bukan Windows
+            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+        
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n💤 Bot dihentikan oleh user")
