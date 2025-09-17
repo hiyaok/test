@@ -1698,18 +1698,8 @@ async def main():
         print(f"❌ Error saat inisialisasi bot: {e}")
         import traceback
         traceback.print_exc()
-        
         if bot and bot.is_connected():
             await bot.disconnect()
-        return
-    
-    finally:
-        # Cleanup
-        if bot and bot.is_connected():
-            print("🔌 Memutuskan koneksi bot...")
-            await bot.disconnect()
-        
-        print("💤 Bot telah berhenti")
 
 # Health Check Function
 def health_check():
@@ -1798,27 +1788,27 @@ def cleanup_old_backups(keep_days=7):
 # Entry Point
 if __name__ == '__main__':
     try:
-        # Set event loop policy untuk Linux (hindari konflik Telethon)
+        # Set event loop policy untuk Linux
         if os.name != 'nt':  # Bukan Windows
             asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-
+        
         # Run health check
         print("🏥 Menjalankan health check...")
         if not health_check():
             print("❌ Health check gagal! Memperbaiki struktur data...")
             storage = JSONStorage()  # Reinitialize
-
+        
         # Create backup
         print("💾 Membuat backup...")
         create_backup()
-
+        
         # Cleanup old backups
         print("🧹 Membersihkan backup lama...")
         cleanup_old_backups()
-
-        # ✅ Run bot pakai loop Telethon langsung
+        
+        # ✅ Jalankan bot pakai loop milik Telethon
         bot.loop.run_until_complete(main())
-
+        
     except KeyboardInterrupt:
         print("\n💤 Bot dihentikan oleh user")
     except Exception as e:
