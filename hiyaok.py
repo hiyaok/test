@@ -113,7 +113,6 @@ def format_message(title, content="", buttons=None):
     return msg
 
 # Initialize Bot
-bot = None
 
 # State Management
 user_states = {}
