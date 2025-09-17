@@ -1,8 +1,9 @@
 import asyncio
 import json
 import os
-import sqlite3
 from datetime import datetime
+from typing import Dict, List, Optional, Any
+import threading
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import InputPhoneContact, User, Chat, Channel
@@ -12,100 +13,276 @@ from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
 
 # Konfigurasi Bot
-API_ID = "20755791"  # Ganti dengan API ID Anda
-API_HASH = "3d09356fe14a31a5baaad296a1abef80"  # Ganti dengan API Hash Anda
-BOT_TOKEN = "8426128734:AAHYVpJCy7LrofTI3AzyUNhB_42hQnVNwiA"  # Ganti dengan Bot Token Anda
+API_ID = "20755791"
+API_HASH = "3d09356fe14a31a5baaad296a1abef80"
+BOT_TOKEN = "8426128734:AAHYVpJCy7LrofTI3AzyUNhB_42hQnVNwiA"
 
 # Admin Configuration
-ADMIN_UTAMA = 5988451717  # Ganti dengan user ID admin utama
-ADMIN_BOTS = []  # List admin bot
+ADMIN_UTAMA = 5988451717
+ADMIN_BOTS = []
 
-# 🔹 Global connection, dipakai semua fungsi
-conn = sqlite3.connect("bot_data.db", check_same_thread=False, timeout=30)
-cursor = conn.cursor()
+# JSON Storage Configuration
+DATA_DIR = "bot_data"
+KATEGORI_FILE = os.path.join(DATA_DIR, "kategori.json")
+AKUN_TG_FILE = os.path.join(DATA_DIR, "akun_tg.json")
+TEMP_CONTACTS_FILE = os.path.join(DATA_DIR, "temp_contacts.json")
+ADMIN_BOTS_FILE = os.path.join(DATA_DIR, "admin_bots.json")
 
-def init_db():
-    # Set WAL mode (lebih aman buat async)
-    cursor.execute("PRAGMA journal_mode=WAL;")
+# Thread lock untuk file operations
+file_lock = threading.Lock()
 
-    # Tabel kategori
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS kategori (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nama TEXT UNIQUE NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+class JSONStorage:
+    """Thread-safe JSON storage manager"""
+    
+    def __init__(self):
+        self.ensure_data_dir()
+        self.init_json_files()
+    
+    def ensure_data_dir(self):
+        """Pastikan direktori data ada"""
+        if not os.path.exists(DATA_DIR):
+            os.makedirs(DATA_DIR)
+    
+    def init_json_files(self):
+        """Inisialisasi file JSON jika belum ada"""
+        default_data = {
+            KATEGORI_FILE: [],
+            AKUN_TG_FILE: [],
+            TEMP_CONTACTS_FILE: [],
+            ADMIN_BOTS_FILE: []
+        }
+        
+        for file_path, default_content in default_data.items():
+            if not os.path.exists(file_path):
+                self.write_json(file_path, default_content)
+    
+    def read_json(self, file_path: str) -> List[Dict]:
+        """Baca data dari file JSON dengan thread safety"""
+        with file_lock:
+            try:
+                if not os.path.exists(file_path):
+                    return []
+                
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data if isinstance(data, list) else []
+            except (json.JSONDecodeError, FileNotFoundError):
+                return []
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+                return []
+    
+    def write_json(self, file_path: str, data: List[Dict]) -> bool:
+        """Tulis data ke file JSON dengan thread safety"""
+        with file_lock:
+            try:
+                # Create backup
+                backup_path = file_path + '.backup'
+                if os.path.exists(file_path):
+                    import shutil
+                    shutil.copy2(file_path, backup_path)
+                
+                # Write new data
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                
+                # Remove backup if write successful
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                
+                return True
+            except Exception as e:
+                print(f"Error writing {file_path}: {e}")
+                # Restore backup if exists
+                backup_path = file_path + '.backup'
+                if os.path.exists(backup_path):
+                    import shutil
+                    shutil.copy2(backup_path, file_path)
+                    os.remove(backup_path)
+                return False
+    
+    def get_next_id(self, file_path: str) -> int:
+        """Generate ID berikutnya untuk data"""
+        data = self.read_json(file_path)
+        if not data:
+            return 1
+        
+        max_id = max([item.get('id', 0) for item in data], default=0)
+        return max_id + 1
 
-    # Tabel akun telegram
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS akun_tg (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nomor TEXT UNIQUE NOT NULL,
-            session_string TEXT NOT NULL,
-            kategori_id INTEGER,
-            nama_akun TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (kategori_id) REFERENCES kategori (id)
-        )
-    ''')
+# Initialize storage
+storage = JSONStorage()
 
-    # Tabel kontak sementara
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS temp_contacts (
-            user_id INTEGER,
-            contact_data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+# Helper Functions untuk Kategori
+def get_kategori() -> List[tuple]:
+    """Get semua kategori"""
+    data = storage.read_json(KATEGORI_FILE)
+    return [(item['id'], item['nama']) for item in data]
 
-    # Tabel admin
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS admin_bots (
-            user_id INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+def add_kategori(nama: str) -> bool:
+    """Tambah kategori baru"""
+    data = storage.read_json(KATEGORI_FILE)
+    
+    # Check duplicate
+    if any(item['nama'].lower() == nama.lower() for item in data):
+        return False
+    
+    new_kategori = {
+        'id': storage.get_next_id(KATEGORI_FILE),
+        'nama': nama,
+        'created_at': datetime.now().isoformat()
+    }
+    
+    data.append(new_kategori)
+    return storage.write_json(KATEGORI_FILE, data)
 
-    conn.commit()  # ✅ jangan close di sini
+def update_kategori(kategori_id: int, nama_baru: str) -> bool:
+    """Update nama kategori"""
+    data = storage.read_json(KATEGORI_FILE)
+    
+    # Check duplicate (exclude current)
+    if any(item['nama'].lower() == nama_baru.lower() and item['id'] != kategori_id for item in data):
+        return False
+    
+    for item in data:
+        if item['id'] == kategori_id:
+            item['nama'] = nama_baru
+            return storage.write_json(KATEGORI_FILE, data)
+    
+    return False
 
-# Helper Functions
-def is_admin_utama(user_id):
+def get_kategori_by_id(kategori_id: int) -> Optional[Dict]:
+    """Get kategori by ID"""
+    data = storage.read_json(KATEGORI_FILE)
+    return next((item for item in data if item['id'] == kategori_id), None)
+
+# Helper Functions untuk Akun TG
+def get_akun_by_kategori(kategori_id: int) -> List[tuple]:
+    """Get akun berdasarkan kategori"""
+    data = storage.read_json(AKUN_TG_FILE)
+    filtered_data = [item for item in data if item['kategori_id'] == kategori_id]
+    return [(item['id'], item['nomor'], item.get('nama_akun', '')) for item in filtered_data]
+
+def add_akun_tg(nomor: str, session_string: str, kategori_id: int, nama_akun: str = '') -> bool:
+    """Tambah akun TG baru"""
+    data = storage.read_json(AKUN_TG_FILE)
+    
+    # Check duplicate
+    if any(item['nomor'] == nomor for item in data):
+        return False
+    
+    new_akun = {
+        'id': storage.get_next_id(AKUN_TG_FILE),
+        'nomor': nomor,
+        'session_string': session_string,
+        'kategori_id': kategori_id,
+        'nama_akun': nama_akun,
+        'created_at': datetime.now().isoformat()
+    }
+    
+    data.append(new_akun)
+    return storage.write_json(AKUN_TG_FILE, data)
+
+def get_akun_by_id(akun_id: int) -> Optional[Dict]:
+    """Get akun by ID"""
+    data = storage.read_json(AKUN_TG_FILE)
+    return next((item for item in data if item['id'] == akun_id), None)
+
+def delete_akun_by_id(akun_id: int) -> bool:
+    """Hapus akun by ID"""
+    data = storage.read_json(AKUN_TG_FILE)
+    original_length = len(data)
+    data = [item for item in data if item['id'] != akun_id]
+    
+    if len(data) < original_length:
+        return storage.write_json(AKUN_TG_FILE, data)
+    return False
+
+def update_akun_kategori(akun_id: int, new_kategori_id: int) -> bool:
+    """Update kategori akun"""
+    data = storage.read_json(AKUN_TG_FILE)
+    
+    for item in data:
+        if item['id'] == akun_id:
+            item['kategori_id'] = new_kategori_id
+            return storage.write_json(AKUN_TG_FILE, data)
+    
+    return False
+
+# Helper Functions untuk Temp Contacts
+def add_temp_contact(user_id: int, contact_data: Dict) -> bool:
+    """Tambah temporary contact"""
+    data = storage.read_json(TEMP_CONTACTS_FILE)
+    
+    new_contact = {
+        'user_id': user_id,
+        'contact_data': contact_data,
+        'created_at': datetime.now().isoformat()
+    }
+    
+    data.append(new_contact)
+    return storage.write_json(TEMP_CONTACTS_FILE, data)
+
+def get_temp_contacts(user_id: int) -> List[Dict]:
+    """Get temporary contacts by user ID"""
+    data = storage.read_json(TEMP_CONTACTS_FILE)
+    return [item['contact_data'] for item in data if item['user_id'] == user_id]
+
+def clear_temp_contacts(user_id: int) -> bool:
+    """Clear temporary contacts by user ID"""
+    data = storage.read_json(TEMP_CONTACTS_FILE)
+    original_length = len(data)
+    data = [item for item in data if item['user_id'] != user_id]
+    
+    if len(data) < original_length:
+        return storage.write_json(TEMP_CONTACTS_FILE, data)
+    return True
+
+# Helper Functions untuk Admin Bots
+def is_admin_utama(user_id: int) -> bool:
     return user_id == ADMIN_UTAMA
 
-def is_admin_bot(user_id):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM admin_bots WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
+def is_admin_bot(user_id: int) -> bool:
+    data = storage.read_json(ADMIN_BOTS_FILE)
+    return any(item['user_id'] == user_id for item in data)
 
-def is_authorized(user_id):
+def is_authorized(user_id: int) -> bool:
     return is_admin_utama(user_id) or is_admin_bot(user_id)
 
-def get_kategori():
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, nama FROM kategori ORDER BY nama")
-    result = cursor.fetchall()
-    conn.close()
-    return result
+def add_admin_bot(user_id: int, added_by: int) -> bool:
+    """Tambah admin bot"""
+    data = storage.read_json(ADMIN_BOTS_FILE)
+    
+    # Check duplicate
+    if any(item['user_id'] == user_id for item in data):
+        return False
+    
+    new_admin = {
+        'user_id': user_id,
+        'added_by': added_by,
+        'added_at': datetime.now().isoformat()
+    }
+    
+    data.append(new_admin)
+    return storage.write_json(ADMIN_BOTS_FILE, data)
 
-def get_akun_by_kategori(kategori_id):
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, nomor, nama_akun FROM akun_tg 
-        WHERE kategori_id = ? 
-        ORDER BY nomor
-    """, (kategori_id,))
-    result = cursor.fetchall()
-    conn.close()
-    return result
+def get_all_admin_bots() -> List[tuple]:
+    """Get semua admin bots"""
+    data = storage.read_json(ADMIN_BOTS_FILE)
+    return [(item['user_id'], item['added_at']) for item in data]
 
-def format_message(title, content="", buttons=None):
+def delete_admin_bot(user_id: int) -> bool:
+    """Hapus admin bot"""
+    data = storage.read_json(ADMIN_BOTS_FILE)
+    original_length = len(data)
+    data = [item for item in data if item['user_id'] != user_id]
+    
+    if len(data) < original_length:
+        return storage.write_json(ADMIN_BOTS_FILE, data)
+    return False
+
+# Utility Functions
+def format_message(title: str, content: str = "", buttons: List = None) -> str:
     """Format pesan dengan style yang keren"""
     msg = f"━━━━━━━━━━━━━━━━━━\n"
     msg += f"🤖 **{title}** 🤖\n"
@@ -116,6 +293,7 @@ def format_message(title, content="", buttons=None):
 
 # Initialize Bot
 bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
 # State Management
 user_states = {}
 
@@ -202,11 +380,7 @@ async def list_admin_handler(event):
     if not is_admin_utama(event.sender_id):
         return
     
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, added_at FROM admin_bots ORDER BY added_at")
-    admins = cursor.fetchall()
-    conn.close()
+    admins = get_all_admin_bots()
     
     if not admins:
         content = "Belum ada admin bot yang ditambahkan."
@@ -228,6 +402,85 @@ async def list_admin_handler(event):
     buttons = [[Button.inline("🔙 Kembali", "kelola_admin")]]
     msg = format_message("DAFTAR ADMIN BOT", content)
     await event.edit(msg, buttons=buttons)
+
+@bot.on(events.CallbackQuery(data=b'hapus_admin'))
+async def hapus_admin_handler(event):
+    if not is_admin_utama(event.sender_id):
+        return
+    
+    admins = get_all_admin_bots()
+    
+    if not admins:
+        buttons = [[Button.inline("🔙 Kembali", "kelola_admin")]]
+        msg = format_message("TIDAK ADA ADMIN BOT", 
+                            "Belum ada admin bot yang bisa dihapus.")
+        await event.edit(msg, buttons=buttons)
+        return
+    
+    buttons = []
+    for admin_id, _ in admins:
+        try:
+            user = await bot.get_entity(admin_id)
+            name = user.first_name + (f" {user.last_name}" if user.last_name else "")
+            username = f"@{user.username}" if user.username else ""
+            display_name = f"{name} {username}".strip()
+        except:
+            display_name = f"User ID: {admin_id}"
+        
+        buttons.append([Button.inline(f"🗑️ {display_name}", f"confirm_hapus_admin_{admin_id}")])
+    
+    buttons.append([Button.inline("🔙 Kembali", "kelola_admin")])
+    
+    msg = format_message("HAPUS ADMIN BOT 🗑️", 
+                        "Pilih admin yang mau dihapus:")
+    await event.edit(msg, buttons=buttons)
+
+@bot.on(events.CallbackQuery(pattern=r'confirm_hapus_admin_(\d+)'))
+async def confirm_hapus_admin_handler(event):
+    if not is_admin_utama(event.sender_id):
+        return
+    
+    admin_id = int(event.data.decode().split('_')[-1])
+    
+    try:
+        user = await bot.get_entity(admin_id)
+        name = user.first_name + (f" {user.last_name}" if user.last_name else "")
+        display_name = name
+    except:
+        display_name = f"User ID: {admin_id}"
+    
+    buttons = [
+        [Button.inline("✅ Ya, Hapus!", f"execute_hapus_admin_{admin_id}")],
+        [Button.inline("❌ Batal", "hapus_admin")]
+    ]
+    
+    msg = format_message("KONFIRMASI HAPUS ADMIN ⚠️", 
+                       f"Lu yakin mau hapus **{display_name}** dari admin bot?")
+    
+    await event.edit(msg, buttons=buttons)
+
+@bot.on(events.CallbackQuery(pattern=r'execute_hapus_admin_(\d+)'))
+async def execute_hapus_admin_handler(event):
+    if not is_admin_utama(event.sender_id):
+        return
+    
+    admin_id = int(event.data.decode().split('_')[-1])
+    
+    if delete_admin_bot(admin_id):
+        try:
+            user = await bot.get_entity(admin_id)
+            name = user.first_name + (f" {user.last_name}" if user.last_name else "")
+            display_name = name
+        except:
+            display_name = f"User ID: {admin_id}"
+        
+        buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
+        msg = format_message("ADMIN BERHASIL DIHAPUS! ✅", 
+                           f"**{display_name}** udah dihapus dari admin bot!")
+        
+        await event.edit(msg, buttons=buttons)
+    else:
+        await event.answer("❌ Gagal menghapus admin!", alert=True)
 
 # Login Nomor Handler
 @bot.on(events.CallbackQuery(data=b'login_nomor'))
@@ -272,14 +525,13 @@ async def list_akun_kategori_handler(event):
     kategori_id = int(event.data.decode().split('_')[-1])
     
     # Get kategori name
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nama FROM kategori WHERE id = ?", (kategori_id,))
-    kategori_nama = cursor.fetchone()[0]
+    kategori = get_kategori_by_id(kategori_id)
+    if not kategori:
+        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
+        return
     
-    # Get akun in kategori
+    kategori_nama = kategori['nama']
     akun_list = get_akun_by_kategori(kategori_id)
-    conn.close()
     
     if not akun_list:
         content = f"Belum ada akun di kategori **{kategori_nama}**"
@@ -309,7 +561,7 @@ async def tambah_kontak_handler(event):
     await event.edit(msg)
 
 # Message Handler untuk berbagai state
-@bot.on(events.NewMessage(func=lambda e: not e.message.text.startswith('/')))
+@bot.on(events.NewMessage(func=lambda e: not e.message.text.startswith('/') if e.message.text else True))
 async def message_handler(event):
     if not is_authorized(event.sender_id):
         return
@@ -424,6 +676,9 @@ async def message_handler(event):
             contact_data = {
                 "phone": event.message.contact.phone_number,
                 "first_name": event.message.contact.first_name,
+                "last_name": event.contact_data = {
+                "phone": event.message.contact.phone_number,
+                "first_name": event.message.contact.first_name,
                 "last_name": event.message.contact.last_name
             }
             state["contacts"].append(contact_data)
@@ -453,25 +708,152 @@ async def message_handler(event):
             return
         
         # Add to database
-        conn = sqlite3.connect('bot_data.db')
-        cursor = conn.cursor()
-        try:
-            cursor.execute("INSERT INTO admin_bots (user_id, added_by) VALUES (?, ?)", 
-                          (new_admin_id, user_id))
-            conn.commit()
-            
+        if add_admin_bot(new_admin_id, user_id):
             try:
                 user = await bot.get_entity(new_admin_id)
                 name = user.first_name + (f" {user.last_name}" if user.last_name else "")
                 await event.reply(f"✅ **{name}** berhasil ditambahin sebagai admin bot!")
             except:
                 await event.reply(f"✅ **User ID {new_admin_id}** berhasil ditambahin sebagai admin bot!")
-                
-        except sqlite3.IntegrityError:
+        else:
             await event.reply("❌ **User ini udah jadi admin!**")
-        finally:
-            conn.close()
+        
+        del user_states[user_id]
+    
+    elif state["action"] == "buat_kategori":
+        nama_kategori = event.message.text.strip()
+        
+        if not nama_kategori:
+            await event.reply("❌ **Nama kategori tidak boleh kosong!**")
+            return
+        
+        if add_kategori(nama_kategori):
+            await event.reply(format_message("KATEGORI BERHASIL DIBUAT! ✅", 
+                                           f"Kategori **{nama_kategori}** udah dibuat!"))
+            
+            # Continue with previous flow if needed
+            if user_id in user_states:
+                previous_state = user_states[user_id]
+                if "login_step3_pilih_kategori" in str(previous_state):
+                    await show_kategori_selection(event, "Pilih kategori buat nomor ini:")
+                    return
+                elif "tambah_kontak_step2_pilih_kategori" in str(previous_state):
+                    await show_kategori_selection(event, "Pilih kategori akun yang mau dipake:")
+                    return
+        else:
+            await event.reply("❌ **Nama kategori udah ada!** Pake nama yang lain.")
+            return
+        
+        if user_id in user_states:
             del user_states[user_id]
+    
+    elif state["action"] == "edit_nama_kategori":
+        nama_baru = event.message.text.strip()
+        
+        if not nama_baru:
+            await event.reply("❌ **Nama kategori tidak boleh kosong!**")
+            return
+        
+        kategori_id = state["kategori_id"]
+        old_name = state["old_name"]
+        
+        if update_kategori(kategori_id, nama_baru):
+            buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
+            msg = format_message("NAMA KATEGORI BERHASIL DIUBAH! ✅", 
+                               f"**Nama lama:** {old_name}\n" +
+                               f"**Nama baru:** {nama_baru}")
+            
+            await event.reply(msg, buttons=buttons)
+        else:
+            await event.reply("❌ **Nama kategori udah ada!** Pake nama yang lain.")
+            return
+        
+        del user_states[user_id]
+    
+    elif state["action"] == "invite_input_grup":
+        grup_input = event.message.text.strip()
+        akun_id = state["akun_id"]
+        
+        try:
+            # Get akun data
+            akun = get_akun_by_id(akun_id)
+            
+            if not akun:
+                await event.reply("❌ **Akun tidak ditemukan!**")
+                del user_states[user_id]
+                return
+            
+            nomor = akun['nomor']
+            session_string = akun['session_string']
+            
+            # Connect with the account
+            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+            await client.connect()
+            
+            # Get the target entity (group/channel)
+            try:
+                target_entity = await client.get_entity(grup_input)
+            except Exception:
+                await event.reply("❌ **Grup/Channel tidak ditemukan!** Cek lagi username atau link nya.")
+                await client.disconnect()
+                return
+            
+            # Get all contacts
+            contacts = await client(GetContactsRequest(hash=0))
+            
+            if not contacts.users:
+                await client.disconnect()
+                await event.reply("❌ **Akun ini tidak punya kontak untuk di-invite!**")
+                del user_states[user_id]
+                return
+            
+            # Invite contacts to the group/channel
+            success_count = 0
+            total_count = len(contacts.users)
+            
+            msg_status = await event.reply(format_message("PROSES INVITE... ⏳", 
+                                         f"Mulai invite {total_count} kontak ke grup/channel..."))
+            
+            for i, user in enumerate(contacts.users):
+                try:
+                    if isinstance(target_entity, Channel):
+                        await client(InviteToChannelRequest(target_entity, [user]))
+                    else:
+                        await client(AddChatUserRequest(target_entity.id, user.id, 0))
+                    
+                    success_count += 1
+                    
+                    # Update progress every 10 invites
+                    if (i + 1) % 10 == 0:
+                        progress_msg = format_message("PROSES INVITE... ⏳", 
+                                                    f"Progress: {i + 1}/{total_count}\n" +
+                                                    f"Berhasil: {success_count}")
+                        await msg_status.edit(progress_msg)
+                        
+                        # Add delay to avoid flood limits
+                        await asyncio.sleep(2)
+                
+                except Exception as e:
+                    # Skip users that can't be added
+                    continue
+            
+            await client.disconnect()
+            
+            # Final result
+            buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
+            msg = format_message("INVITE SELESAI! 🎉", 
+                               f"**Akun:** {nomor}\n" +
+                               f"**Target:** {target_entity.title if hasattr(target_entity, 'title') else grup_input}\n" +
+                               f"**Berhasil di-invite:** {success_count}/{total_count} kontak\n\n" +
+                               "Proses invite sudah selesai!")
+            
+            await msg_status.edit(msg, buttons=buttons)
+            
+        except Exception as e:
+            await event.reply(f"❌ **Error:** {str(e)}")
+        finally:
+            if user_id in user_states:
+                del user_states[user_id]
 
 # Done Command Handler
 @bot.on(events.NewMessage(pattern='/done'))
@@ -492,19 +874,10 @@ async def done_handler(event):
             return
         
         # Save contacts temporarily
-        conn = sqlite3.connect('bot_data.db')
-        cursor = conn.cursor()
+        clear_temp_contacts(user_id)  # Clear old temp contacts
         
-        # Clear old temp contacts for this user
-        cursor.execute("DELETE FROM temp_contacts WHERE user_id = ?", (user_id,))
-        
-        # Save new temp contacts
         for contact in state["contacts"]:
-            cursor.execute("INSERT INTO temp_contacts (user_id, contact_data) VALUES (?, ?)",
-                          (user_id, json.dumps(contact)))
-        
-        conn.commit()
-        conn.close()
+            add_temp_contact(user_id, contact)
         
         user_states[user_id] = {"action": "tambah_kontak_step2_pilih_kategori"}
         
@@ -547,46 +920,31 @@ async def pilih_kategori_handler(event):
     state = user_states[user_id]
     
     # Get kategori name
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nama FROM kategori WHERE id = ?", (kategori_id,))
-    result = cursor.fetchone()
+    kategori = get_kategori_by_id(kategori_id)
     
-    if not result:
+    if not kategori:
         await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        conn.close()
         return
     
-    kategori_nama = result[0]
+    kategori_nama = kategori['nama']
     
     if state["action"] == "login_step3_pilih_kategori":
         # Save akun to database
-        try:
-            cursor.execute("""
-                INSERT INTO akun_tg (nomor, session_string, kategori_id, nama_akun) 
-                VALUES (?, ?, ?, ?)
-            """, (state["nomor"], state["session_string"], kategori_id, state["nama_akun"]))
-            conn.commit()
-            
+        if add_akun_tg(state["nomor"], state["session_string"], kategori_id, state["nama_akun"]):
             msg = format_message("LOGIN BERHASIL! 🎉", 
                                f"Akun **{state['nomor']}** berhasil ditambahin ke kategori **{kategori_nama}**!\n\n" +
                                f"👤 **Nama Akun:** {state['nama_akun']}")
             
             buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
             await event.edit(msg, buttons=buttons)
-            
-        except sqlite3.IntegrityError:
+        else:
             await event.answer("❌ Nomor ini udah ada di database!", alert=True)
-        except Exception as e:
-            await event.answer(f"❌ Error: {str(e)}", alert=True)
-        finally:
-            conn.close()
-            del user_states[user_id]
+        
+        del user_states[user_id]
     
     elif state["action"] == "tambah_kontak_step2_pilih_kategori":
         # Get akun in selected kategori
         akun_list = get_akun_by_kategori(kategori_id)
-        conn.close()
         
         if not akun_list:
             await event.answer(f"❌ Belum ada akun di kategori {kategori_nama}!", alert=True)
@@ -618,21 +976,17 @@ async def pilih_akun_kontak_handler(event):
     user_id = event.sender_id
     
     # Get akun data
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nomor, session_string FROM akun_tg WHERE id = ?", (akun_id,))
-    akun_data = cursor.fetchone()
+    akun = get_akun_by_id(akun_id)
     
     # Get temp contacts
-    cursor.execute("SELECT contact_data FROM temp_contacts WHERE user_id = ?", (user_id,))
-    temp_contacts = cursor.fetchall()
-    conn.close()
+    temp_contacts = get_temp_contacts(user_id)
     
-    if not akun_data or not temp_contacts:
+    if not akun or not temp_contacts:
         await event.answer("❌ Data tidak ditemukan!", alert=True)
         return
     
-    nomor, session_string = akun_data
+    nomor = akun['nomor']
+    session_string = akun['session_string']
     
     try:
         # Connect with the selected account
@@ -641,9 +995,7 @@ async def pilih_akun_kontak_handler(event):
         
         # Prepare contacts for import
         contacts_to_import = []
-        for i, (contact_json,) in enumerate(temp_contacts):
-            contact_data = json.loads(contact_json)
-            
+        for i, contact_data in enumerate(temp_contacts):
             contact = InputPhoneContact(
                 client_id=i,
                 phone='+' + contact_data['phone'].replace('+', ''),
@@ -658,11 +1010,7 @@ async def pilih_akun_kontak_handler(event):
         await client.disconnect()
         
         # Clear temp contacts
-        conn = sqlite3.connect('bot_data.db')
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM temp_contacts WHERE user_id = ?", (user_id,))
-        conn.commit()
-        conn.close()
+        clear_temp_contacts(user_id)
         
         success_count = len(result.imported)
         total_count = len(contacts_to_import)
@@ -760,21 +1108,14 @@ async def hapus_nomor_kategori_handler(event):
     kategori_id = int(event.data.decode().split('_')[-1])
     
     # Get kategori name
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nama FROM kategori WHERE id = ?", (kategori_id,))
-    result = cursor.fetchone()
+    kategori = get_kategori_by_id(kategori_id)
     
-    if not result:
+    if not kategori:
         await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        conn.close()
         return
     
-    kategori_nama = result[0]
-    
-    # Get akun in kategori
+    kategori_nama = kategori['nama']
     akun_list = get_akun_by_kategori(kategori_id)
-    conn.close()
     
     if not akun_list:
         buttons = [[Button.inline("🔙 Kembali", "hapus_nomor")]]
@@ -804,17 +1145,14 @@ async def confirm_hapus_handler(event):
     akun_id = int(event.data.decode().split('_')[-1])
     
     # Get akun info
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nomor, nama_akun FROM akun_tg WHERE id = ?", (akun_id,))
-    result = cursor.fetchone()
-    conn.close()
+    akun = get_akun_by_id(akun_id)
     
-    if not result:
+    if not akun:
         await event.answer("❌ Akun tidak ditemukan!", alert=True)
         return
     
-    nomor, nama_akun = result
+    nomor = akun['nomor']
+    nama_akun = akun.get('nama_akun', '')
     display_name = f"{nomor}"
     if nama_akun:
         display_name += f" ({nama_akun})"
@@ -837,27 +1175,23 @@ async def execute_hapus_handler(event):
     
     akun_id = int(event.data.decode().split('_')[-1])
     
-    # Delete from database
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nomor FROM akun_tg WHERE id = ?", (akun_id,))
-    result = cursor.fetchone()
+    # Get akun info before deletion
+    akun = get_akun_by_id(akun_id)
     
-    if not result:
+    if not akun:
         await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        conn.close()
         return
     
-    nomor = result[0]
-    cursor.execute("DELETE FROM akun_tg WHERE id = ?", (akun_id,))
-    conn.commit()
-    conn.close()
+    nomor = akun['nomor']
     
-    buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
-    msg = format_message("BERHASIL DIHAPUS! ✅", 
-                       f"Akun **{nomor}** berhasil dihapus dari database!")
-    
-    await event.edit(msg, buttons=buttons)
+    if delete_akun_by_id(akun_id):
+        buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
+        msg = format_message("BERHASIL DIHAPUS! ✅", 
+                           f"Akun **{nomor}** berhasil dihapus dari database!")
+        
+        await event.edit(msg, buttons=buttons)
+    else:
+        await event.answer("❌ Gagal menghapus akun!", alert=True)
 
 # Clear Kontak Handler
 @bot.on(events.CallbackQuery(data=b'clear_kontak'))
@@ -891,19 +1225,14 @@ async def clear_kontak_kategori_handler(event):
     kategori_id = int(event.data.decode().split('_')[-1])
     
     # Get kategori name and akun list
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nama FROM kategori WHERE id = ?", (kategori_id,))
-    result = cursor.fetchone()
+    kategori = get_kategori_by_id(kategori_id)
     
-    if not result:
+    if not kategori:
         await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        conn.close()
         return
     
-    kategori_nama = result[0]
+    kategori_nama = kategori['nama']
     akun_list = get_akun_by_kategori(kategori_id)
-    conn.close()
     
     if not akun_list:
         buttons = [[Button.inline("🔙 Kembali", "clear_kontak")]]
@@ -933,17 +1262,14 @@ async def confirm_clear_handler(event):
     akun_id = int(event.data.decode().split('_')[-1])
     
     # Get akun info
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nomor, nama_akun FROM akun_tg WHERE id = ?", (akun_id,))
-    result = cursor.fetchone()
-    conn.close()
+    akun = get_akun_by_id(akun_id)
     
-    if not result:
+    if not akun:
         await event.answer("❌ Akun tidak ditemukan!", alert=True)
         return
     
-    nomor, nama_akun = result
+    nomor = akun['nomor']
+    nama_akun = akun.get('nama_akun', '')
     display_name = f"{nomor}"
     if nama_akun:
         display_name += f" ({nama_akun})"
@@ -967,17 +1293,14 @@ async def execute_clear_handler(event):
     akun_id = int(event.data.decode().split('_')[-1])
     
     # Get akun data
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nomor, session_string FROM akun_tg WHERE id = ?", (akun_id,))
-    result = cursor.fetchone()
-    conn.close()
+    akun = get_akun_by_id(akun_id)
     
-    if not result:
+    if not akun:
         await event.answer("❌ Akun tidak ditemukan!", alert=True)
         return
     
-    nomor, session_string = result
+    nomor = akun['nomor']
+    session_string = akun['session_string']
     
     try:
         # Connect with the account
@@ -1018,20 +1341,26 @@ async def invite_grup_handler(event):
     
     kategori_list = get_kategori()
     if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", "back_to_main")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
+        buttons = [[Button.inline("🔙 Kembali", b"back_to_main")]]
+        msg = format_message(
+            "BELUM ADA KATEGORI", 
+            "Belum ada kategori yang dibuat."
+        )
         await event.edit(msg, buttons=buttons)
         return
     
     buttons = []
     for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"invite_grup_kat_{kat_id}")])
+        buttons.append([
+            Button.inline(f"📁 {kat_nama}", f"invite_grup_kat_{kat_id}".encode())
+        ])
     
-    buttons.append([Button.inline("🔙 Kembali", "back_to_main")])
+    buttons.append([Button.inline("🔙 Kembali", b"back_to_main")])
     
-    msg = format_message("INVITE KE GRUP/CHANNEL 👥", 
-                        "Pilih kategori akun yang mau dipake:")
+    msg = format_message(
+        "INVITE KE GRUP/CHANNEL 👥", 
+        "Pilih kategori akun yang mau dipake:"
+    )
     await event.edit(msg, buttons=buttons)
 
 @bot.on(events.CallbackQuery(pattern=r'invite_grup_kat_(\d+)'))
@@ -1042,19 +1371,14 @@ async def invite_grup_kategori_handler(event):
     kategori_id = int(event.data.decode().split('_')[-1])
     
     # Get kategori name and akun list
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nama FROM kategori WHERE id = ?", (kategori_id,))
-    result = cursor.fetchone()
+    kategori = get_kategori_by_id(kategori_id)
     
-    if not result:
+    if not kategori:
         await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        conn.close()
         return
     
-    kategori_nama = result[0]
+    kategori_nama = kategori['nama']
     akun_list = get_akun_by_kategori(kategori_id)
-    conn.close()
     
     if not akun_list:
         buttons = [[Button.inline("🔙 Kembali", "invite_grup")]]
@@ -1131,17 +1455,13 @@ async def edit_kategori_nama_handler(event):
     kategori_id = int(event.data.decode().split('_')[-1])
     
     # Get current kategori name
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nama FROM kategori WHERE id = ?", (kategori_id,))
-    result = cursor.fetchone()
-    conn.close()
+    kategori = get_kategori_by_id(kategori_id)
     
-    if not result:
+    if not kategori:
         await event.answer("❌ Kategori tidak ditemukan!", alert=True)
         return
     
-    kategori_nama = result[0]
+    kategori_nama = kategori['nama']
     
     user_states[event.sender_id] = {
         "action": "edit_nama_kategori",
@@ -1181,261 +1501,6 @@ async def pindah_kategori_handler(event):
                         "Pilih kategori ASAL (kategori yang punya nomor yang mau dipindah):")
     await event.edit(msg, buttons=buttons)
 
-# Continue with message handler for various states...
-@bot.on(events.NewMessage(func=lambda e: e.sender_id in user_states and user_states[e.sender_id].get("action") in [
-    "buat_kategori", "edit_nama_kategori", "invite_input_grup"
-]))
-async def state_message_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    user_id = event.sender_id
-    state = user_states[user_id]
-    
-    if state["action"] == "buat_kategori":
-        nama_kategori = event.message.text.strip()
-        
-        if not nama_kategori:
-            await event.reply("❌ **Nama kategori tidak boleh kosong!**")
-            return
-        
-        # Save kategori to database
-        conn = sqlite3.connect('bot_data.db')
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("INSERT INTO kategori (nama) VALUES (?)", (nama_kategori,))
-            conn.commit()
-            
-            await event.reply(format_message("KATEGORI BERHASIL DIBUAT! ✅", 
-                                           f"Kategori **{nama_kategori}** udah dibuat!"))
-            
-            # Continue with previous flow if needed
-            if user_id in user_states:
-                previous_state = user_states[user_id]
-                if "login_step3_pilih_kategori" in str(previous_state):
-                    await show_kategori_selection(event, "Pilih kategori buat nomor ini:")
-                    return
-                elif "tambah_kontak_step2_pilih_kategori" in str(previous_state):
-                    await show_kategori_selection(event, "Pilih kategori akun yang mau dipake:")
-                    return
-            
-        except sqlite3.IntegrityError:
-            await event.reply("❌ **Nama kategori udah ada!** Pake nama yang lain.")
-            return
-        finally:
-            conn.close()
-            if user_id in user_states:
-                del user_states[user_id]
-    
-    elif state["action"] == "edit_nama_kategori":
-        nama_baru = event.message.text.strip()
-        
-        if not nama_baru:
-            await event.reply("❌ **Nama kategori tidak boleh kosong!**")
-            return
-        
-        kategori_id = state["kategori_id"]
-        old_name = state["old_name"]
-        
-        # Update kategori name
-        conn = sqlite3.connect('bot_data.db')
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("UPDATE kategori SET nama = ? WHERE id = ?", (nama_baru, kategori_id))
-            conn.commit()
-            
-            buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
-            msg = format_message("NAMA KATEGORI BERHASIL DIUBAH! ✅", 
-                               f"**Nama lama:** {old_name}\n" +
-                               f"**Nama baru:** {nama_baru}")
-            
-            await event.reply(msg, buttons=buttons)
-            
-        except sqlite3.IntegrityError:
-            await event.reply("❌ **Nama kategori udah ada!** Pake nama yang lain.")
-            return
-        finally:
-            conn.close()
-            del user_states[user_id]
-    
-    elif state["action"] == "invite_input_grup":
-        grup_input = event.message.text.strip()
-        akun_id = state["akun_id"]
-        
-        try:
-            # Get akun data
-            conn = sqlite3.connect('bot_data.db')
-            cursor = conn.cursor()
-            cursor.execute("SELECT nomor, session_string FROM akun_tg WHERE id = ?", (akun_id,))
-            result = cursor.fetchone()
-            conn.close()
-            
-            if not result:
-                await event.reply("❌ **Akun tidak ditemukan!**")
-                del user_states[user_id]
-                return
-            
-            nomor, session_string = result
-            
-            # Connect with the account
-            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-            await client.connect()
-            
-            # Get the target entity (group/channel)
-            try:
-                target_entity = await client.get_entity(grup_input)
-            except Exception:
-                await event.reply("❌ **Grup/Channel tidak ditemukan!** Cek lagi username atau link nya.")
-                await client.disconnect()
-                return
-            
-            # Get all contacts
-            contacts = await client(GetContactsRequest(hash=0))
-            
-            if not contacts.users:
-                await client.disconnect()
-                await event.reply("❌ **Akun ini tidak punya kontak untuk di-invite!**")
-                del user_states[user_id]
-                return
-            
-            # Invite contacts to the group/channel
-            success_count = 0
-            total_count = len(contacts.users)
-            
-            msg_status = await event.reply(format_message("PROSES INVITE... ⏳", 
-                                         f"Mulai invite {total_count} kontak ke grup/channel..."))
-            
-            for i, user in enumerate(contacts.users):
-                try:
-                    if isinstance(target_entity, Channel):
-                        await client(InviteToChannelRequest(target_entity, [user]))
-                    else:
-                        await client(AddChatUserRequest(target_entity.id, user.id, 0))
-                    
-                    success_count += 1
-                    
-                    # Update progress every 10 invites
-                    if (i + 1) % 10 == 0:
-                        progress_msg = format_message("PROSES INVITE... ⏳", 
-                                                    f"Progress: {i + 1}/{total_count}\n" +
-                                                    f"Berhasil: {success_count}")
-                        await msg_status.edit(progress_msg)
-                        
-                        # Add delay to avoid flood limits
-                        await asyncio.sleep(2)
-                
-                except Exception as e:
-                    # Skip users that can't be added
-                    continue
-            
-            await client.disconnect()
-            
-            # Final result
-            buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
-            msg = format_message("INVITE SELESAI! 🎉", 
-                               f"**Akun:** {nomor}\n" +
-                               f"**Target:** {target_entity.title if hasattr(target_entity, 'title') else grup_input}\n" +
-                               f"**Berhasil di-invite:** {success_count}/{total_count} kontak\n\n" +
-                               "Proses invite sudah selesai!")
-            
-            await msg_status.edit(msg, buttons=buttons)
-            
-        except Exception as e:
-            await event.reply(f"❌ **Error:** {str(e)}")
-        finally:
-            if user_id in user_states:
-                del user_states[user_id]
-
-# Hapus Admin Handler
-@bot.on(events.CallbackQuery(data=b'hapus_admin'))
-async def hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM admin_bots ORDER BY added_at")
-    admins = cursor.fetchall()
-    conn.close()
-    
-    if not admins:
-        buttons = [[Button.inline("🔙 Kembali", "kelola_admin")]]
-        msg = format_message("TIDAK ADA ADMIN BOT", 
-                            "Belum ada admin bot yang bisa dihapus.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for admin_id, in admins:
-        try:
-            user = await bot.get_entity(admin_id)
-            name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-            username = f"@{user.username}" if user.username else ""
-            display_name = f"{name} {username}".strip()
-        except:
-            display_name = f"User ID: {admin_id}"
-        
-        buttons.append([Button.inline(f"🗑️ {display_name}", f"confirm_hapus_admin_{admin_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "kelola_admin")])
-    
-    msg = format_message("HAPUS ADMIN BOT 🗑️", 
-                        "Pilih admin yang mau dihapus:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'confirm_hapus_admin_(\d+)'))
-async def confirm_hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    admin_id = int(event.data.decode().split('_')[-1])
-    
-    try:
-        user = await bot.get_entity(admin_id)
-        name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-        display_name = name
-    except:
-        display_name = f"User ID: {admin_id}"
-    
-    buttons = [
-        [Button.inline("✅ Ya, Hapus!", f"execute_hapus_admin_{admin_id}")],
-        [Button.inline("❌ Batal", "hapus_admin")]
-    ]
-    
-    msg = format_message("KONFIRMASI HAPUS ADMIN ⚠️", 
-                       f"Lu yakin mau hapus **{display_name}** dari admin bot?")
-    
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'execute_hapus_admin_(\d+)'))
-async def execute_hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    admin_id = int(event.data.decode().split('_')[-1])
-    
-    # Delete from database
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM admin_bots WHERE user_id = ?", (admin_id,))
-    conn.commit()
-    conn.close()
-    
-    try:
-        user = await bot.get_entity(admin_id)
-        name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-        display_name = name
-    except:
-        display_name = f"User ID: {admin_id}"
-    
-    buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
-    msg = format_message("ADMIN BERHASIL DIHAPUS! ✅", 
-                       f"**{display_name}** udah dihapus dari admin bot!")
-    
-    await event.edit(msg, buttons=buttons)
-
 # Pindah Nomor Kategori Handlers
 @bot.on(events.CallbackQuery(pattern=r'pindah_dari_kat_(\d+)'))
 async def pindah_dari_kategori_handler(event):
@@ -1445,19 +1510,14 @@ async def pindah_dari_kategori_handler(event):
     kategori_id = int(event.data.decode().split('_')[-1])
     
     # Get kategori name and akun list
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nama FROM kategori WHERE id = ?", (kategori_id,))
-    result = cursor.fetchone()
+    kategori = get_kategori_by_id(kategori_id)
     
-    if not result:
+    if not kategori:
         await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        conn.close()
         return
     
-    kategori_nama = result[0]
+    kategori_nama = kategori['nama']
     akun_list = get_akun_by_kategori(kategori_id)
-    conn.close()
     
     if not akun_list:
         buttons = [[Button.inline("🔙 Kembali", "pindah_kategori")]]
@@ -1487,22 +1547,19 @@ async def pilih_nomor_pindah_handler(event):
     akun_id = int(event.data.decode().split('_')[-1])
     
     # Get akun info
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nomor, nama_akun, kategori_id FROM akun_tg WHERE id = ?", (akun_id,))
-    result = cursor.fetchone()
+    akun = get_akun_by_id(akun_id)
     
-    if not result:
+    if not akun:
         await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        conn.close()
         return
     
-    nomor, nama_akun, current_kategori_id = result
+    nomor = akun['nomor']
+    nama_akun = akun.get('nama_akun', '')
+    current_kategori_id = akun['kategori_id']
     
     # Get all kategori except current
-    cursor.execute("SELECT id, nama FROM kategori WHERE id != ? ORDER BY nama", (current_kategori_id,))
-    other_kategori = cursor.fetchall()
-    conn.close()
+    all_kategori = get_kategori()
+    other_kategori = [(kat_id, kat_nama) for kat_id, kat_nama in all_kategori if kat_id != current_kategori_id]
     
     if not other_kategori:
         buttons = [[Button.inline("🔙 Kembali", "pindah_kategori")]]
@@ -1535,38 +1592,33 @@ async def pindah_ke_kategori_handler(event):
     new_kategori_id = int(data_parts[-1])
     
     # Get akun info
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT nomor, nama_akun FROM akun_tg WHERE id = ?", (akun_id,))
-    akun_result = cursor.fetchone()
+    akun = get_akun_by_id(akun_id)
     
     # Get kategori names
-    cursor.execute("SELECT nama FROM kategori WHERE id = ?", (new_kategori_id,))
-    kategori_result = cursor.fetchone()
+    kategori = get_kategori_by_id(new_kategori_id)
     
-    if not akun_result or not kategori_result:
+    if not akun or not kategori:
         await event.answer("❌ Data tidak ditemukan!", alert=True)
-        conn.close()
         return
     
-    nomor, nama_akun = akun_result
-    kategori_nama = kategori_result[0]
+    nomor = akun['nomor']
+    nama_akun = akun.get('nama_akun', '')
+    kategori_nama = kategori['nama']
     
     # Update kategori
-    cursor.execute("UPDATE akun_tg SET kategori_id = ? WHERE id = ?", (new_kategori_id, akun_id))
-    conn.commit()
-    conn.close()
-    
-    display_name = f"{nomor}"
-    if nama_akun:
-        display_name += f" ({nama_akun})"
-    
-    buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
-    msg = format_message("NOMOR BERHASIL DIPINDAH! ✅", 
-                       f"**Nomor:** {display_name}\n" +
-                       f"**Kategori baru:** {kategori_nama}")
-    
-    await event.edit(msg, buttons=buttons)
+    if update_akun_kategori(akun_id, new_kategori_id):
+        display_name = f"{nomor}"
+        if nama_akun:
+            display_name += f" ({nama_akun})"
+        
+        buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
+        msg = format_message("NOMOR BERHASIL DIPINDAH! ✅", 
+                           f"**Nomor:** {display_name}\n" +
+                           f"**Kategori baru:** {kategori_nama}")
+        
+        await event.edit(msg, buttons=buttons)
+    else:
+        await event.answer("❌ Gagal memindahkan nomor!", alert=True)
 
 # Error Handler
 @bot.on(events.NewMessage)
@@ -1585,28 +1637,53 @@ async def error_handler(event):
         state = user_states[user_id]
         
         # Handle states that expect text input but not handled by state_message_handler
-        if state["action"] not in ["buat_kategori", "edit_nama_kategori", "invite_input_grup"]:
+        expected_text_states = ["buat_kategori", "edit_nama_kategori", "invite_input_grup", 
+                               "login_step1", "login_step2", "login_step2_password", 
+                               "tambah_admin"]
+        
+        if state["action"] not in expected_text_states:
             await event.reply("❌ **Perintah tidak dikenali!**\n\n" + 
                             "Gunakan tombol yang tersedia atau ketik /start untuk kembali ke menu utama.")
 
-# Run Bot
+# Main Function
 async def main():
-    global bot
+    """Main function untuk menjalankan bot"""
     
     print("🤖 Bot Telegram Manager dimulai...")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     
-    # Initialize database
-    init_db()
-    print("✅ Database berhasil diinisialisasi")
-    
-    # Initialize bot dengan proper error handling
     try:
-        bot = TelegramClient('bot_session', API_ID, API_HASH)
+        # Initialize storage
+        print("📁 Menginisialisasi JSON storage...")
+        storage.ensure_data_dir()
+        storage.init_json_files()
+        print("✅ JSON storage berhasil diinisialisasi")
+        
+        # Test JSON operations
+        print("🔍 Testing JSON operations...")
+        test_data = storage.read_json(KATEGORI_FILE)
+        storage.write_json(KATEGORI_FILE, test_data)
+        print("✅ JSON operations working properly")
+        
+        # Initialize bot
+        print("🤖 Menginisialisasi bot...")
         await bot.start(bot_token=BOT_TOKEN)
         
+        # Get bot info
         me = await bot.get_me()
         print(f"✅ Bot berhasil login sebagai @{me.username}")
+        print(f"📊 Bot ID: {me.id}")
+        
+        # Show statistics
+        kategori_count = len(get_kategori())
+        akun_count = len(storage.read_json(AKUN_TG_FILE))
+        admin_count = len(get_all_admin_bots())
+        
+        print(f"📈 Statistik saat ini:")
+        print(f"   📁 Kategori: {kategori_count}")
+        print(f"   📱 Akun TG: {akun_count}")
+        print(f"   👨‍💼 Admin Bot: {admin_count}")
+        
         print("🚀 Bot siap digunakan!")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         
@@ -1615,21 +1692,134 @@ async def main():
         
     except Exception as e:
         print(f"❌ Error saat inisialisasi bot: {e}")
-        if bot:
-            await bot.disconnect()
-        return
-    finally:
+        import traceback
+        traceback.print_exc()
+        
         if bot and bot.is_connected():
             await bot.disconnect()
+        return
+    
+    finally:
+        # Cleanup
+        if bot and bot.is_connected():
+            print("🔌 Memutuskan koneksi bot...")
+            await bot.disconnect()
+        
+        print("💤 Bot telah berhenti")
 
+# Health Check Function
+def health_check():
+    """Check kesehatan JSON files"""
+    try:
+        # Check if data directory exists
+        if not os.path.exists(DATA_DIR):
+            print("❌ Data directory tidak ditemukan!")
+            return False
+        
+        # Check if all JSON files are readable
+        files_to_check = [KATEGORI_FILE, AKUN_TG_FILE, TEMP_CONTACTS_FILE, ADMIN_BOTS_FILE]
+        
+        for file_path in files_to_check:
+            data = storage.read_json(file_path)
+            if not isinstance(data, list):
+                print(f"❌ File {file_path} format tidak valid!")
+                return False
+        
+        print("✅ Semua JSON files sehat")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Health check error: {e}")
+        return False
+
+# Backup Function
+def create_backup():
+    """Buat backup dari semua data JSON"""
+    try:
+        import shutil
+        from datetime import datetime
+        
+        backup_dir = os.path.join(DATA_DIR, "backups")
+        if not os.path.exists(backup_dir):
+            os.makedirs(backup_dir)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_subdir = os.path.join(backup_dir, f"backup_{timestamp}")
+        os.makedirs(backup_subdir)
+        
+        files_to_backup = [KATEGORI_FILE, AKUN_TG_FILE, TEMP_CONTACTS_FILE, ADMIN_BOTS_FILE]
+        
+        for file_path in files_to_backup:
+            if os.path.exists(file_path):
+                filename = os.path.basename(file_path)
+                backup_path = os.path.join(backup_subdir, filename)
+                shutil.copy2(file_path, backup_path)
+        
+        print(f"✅ Backup berhasil dibuat di: {backup_subdir}")
+        return backup_subdir
+        
+    except Exception as e:
+        print(f"❌ Backup error: {e}")
+        return None
+
+# Cleanup Function
+def cleanup_old_backups(keep_days=7):
+    """Hapus backup lama"""
+    try:
+        import time
+        
+        backup_dir = os.path.join(DATA_DIR, "backups")
+        if not os.path.exists(backup_dir):
+            return
+        
+        current_time = time.time()
+        cutoff_time = current_time - (keep_days * 24 * 60 * 60)  # keep_days dalam detik
+        
+        removed_count = 0
+        for backup_folder in os.listdir(backup_dir):
+            backup_path = os.path.join(backup_dir, backup_folder)
+            if os.path.isdir(backup_path):
+                folder_time = os.path.getctime(backup_path)
+                if folder_time < cutoff_time:
+                    import shutil
+                    shutil.rmtree(backup_path)
+                    removed_count += 1
+        
+        if removed_count > 0:
+            print(f"🧹 {removed_count} backup lama berhasil dihapus")
+        
+    except Exception as e:
+        print(f"❌ Cleanup error: {e}")
+
+# Entry Point
 if __name__ == '__main__':
     try:
         # Set event loop policy untuk Linux
         if os.name != 'nt':  # Bukan Windows
             asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
         
+        # Run health check
+        print("🏥 Menjalankan health check...")
+        if not health_check():
+            print("❌ Health check gagal! Memperbaiki struktur data...")
+            storage = JSONStorage()  # Reinitialize
+        
+        # Create backup
+        print("💾 Membuat backup...")
+        create_backup()
+        
+        # Cleanup old backups
+        print("🧹 Membersihkan backup lama...")
+        cleanup_old_backups()
+        
+        # Run bot
         asyncio.run(main())
+        
     except KeyboardInterrupt:
         print("\n💤 Bot dihentikan oleh user")
     except Exception as e:
         print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("👋 Terima kasih telah menggunakan Bot Telegram Manager!")
