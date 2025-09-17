@@ -1816,8 +1816,8 @@ if __name__ == '__main__':
         print("🧹 Membersihkan backup lama...")
         cleanup_old_backups()
         
-        # Run bot
-        asyncio.run(main())
+        # ✅ Run bot pakai loop dari Telethon, bukan asyncio.run()
+        bot.loop.run_until_complete(main())
         
     except KeyboardInterrupt:
         print("\n💤 Bot dihentikan oleh user")
