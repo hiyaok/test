@@ -1,3 +1,5 @@
+# SAVES KONTAK
+# BY HIYAOK ON TELEGRAM
 import asyncio
 import logging
 import json
@@ -145,34 +147,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
 
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_panel(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     """Handler untuk command /admin - khusus main admin"""
-    user_id = update.effective_user.id
-    
+    if isinstance(update_or_query, Update):  
+        # kalau dari /admin command
+        user_id = update_or_query.effective_user.id
+        reply_func = update_or_query.message.reply_text
+    else:  
+        # kalau dari callback
+        user_id = update_or_query.from_user.id
+        reply_func = update_or_query.edit_message_text
+
     if not tg_manager.is_main_admin(user_id):
-        await update.message.reply_text("❌ Command ini khusus main admin doang!")
+        await reply_func("❌ Command ini khusus main admin doang!")
         return
-    
+
     text = "👑 *Panel Admin Utama*\n\n"
     text += f"Total Admin: {len(tg_manager.admins)}\n\n"
     text += "*List Admin Biasa:*\n"
-    
+
     admin_list = [admin for admin in tg_manager.admins if admin != MAIN_ADMIN]
     if admin_list:
         for i, admin in enumerate(admin_list, 1):
             text += f"{i}. `{admin}`\n"
     else:
         text += "_Belum ada admin biasa_"
-    
+
     keyboard = [
         [InlineKeyboardButton("➕ Tambah Admin", callback_data="add_admin")],
         [InlineKeyboardButton("➖ Hapus Admin", callback_data="remove_admin")],
         [InlineKeyboardButton("📋 List Admin", callback_data="list_admin")],
         [InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]
     ]
-    
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+    await reply_func(text, parse_mode="Markdown", reply_markup=reply_markup)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler untuk semua callback query"""
@@ -407,7 +416,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cek apakah sudah lewat 10 detik dari kontak terakhir
     if current_time - context.user_data.get('last_contact_time', 0) >= 10:
         total_contacts = len(context.user_data['contacts_to_add'])
-        text = f"✅ Kontak diterima! Total: {total_contacts}\n\n"
+        text = f"✅ Kontak diterima!\n\n"
         text += "Kirim kontak lagi atau tekan Done untuk selesai"
         
         keyboard = [
@@ -444,7 +453,7 @@ async def process_add_contacts(query, context, phone):
         success_count = 0
         failed_count = 0
 
-        for contact_info in contacts_to_add:
+        for idx, contact_info in enumerate(contacts_to_add, start=1):
             phone_num = str(contact_info['phone']).replace(" ", "").replace("+", "")
             first_name = contact_info.get('first_name') or "Unknown"
             last_name = contact_info.get('last_name') or ""
@@ -464,7 +473,10 @@ async def process_add_contacts(query, context, phone):
                     ]
                 ))
 
-                await asyncio.sleep(1.5)  # delay aman
+                # Tambahin delay dinamis antar kontak
+                delay = random.uniform(2.5, 5.0)  # delay 2.5–5 detik
+                logger.debug(f"[{phone}] Delay {delay:.2f} detik sebelum lanjut...")
+                await asyncio.sleep(delay)
 
                 # Kalau result ada user_id langsung dianggap sukses
                 if result.users:
@@ -486,7 +498,7 @@ async def process_add_contacts(query, context, phone):
                     entity = await client.get_entity(phone_num)
                     if isinstance(entity, types.User):
                         await client(functions.contacts.DeleteContactsRequest(id=[entity.id]))
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(2)
                 except Exception as e:
                     logger.debug(f"[{phone}] Tidak bisa delete {phone_num}: {e}")
 
@@ -500,7 +512,7 @@ async def process_add_contacts(query, context, phone):
                         )
                     ]
                 ))
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(random.uniform(2.5, 5.0))
 
                 if retry.users:
                     success_count += 1
@@ -512,6 +524,12 @@ async def process_add_contacts(query, context, phone):
             except Exception as e:
                 logger.error(f"[{phone}] Error menambahkan kontak {phone_num}: {e}")
                 failed_count += 1
+
+            # Optional: kasih jeda tambahan tiap 10 kontak biar makin aman
+            if idx % 10 == 0:
+                extra_delay = random.uniform(10, 15)
+                logger.debug(f"[{phone}] Istirahat {extra_delay:.2f} detik (tiap 10 kontak)")
+                await asyncio.sleep(extra_delay)
 
         await client.disconnect()
 
