@@ -1769,55 +1769,10 @@ async def error_handler(event):
 
 # ==================== MAIN FUNCTION ====================
 async def main():
-    """Main function untuk menjalankan bot"""
-    
-    print("🤖 Bot Telegram Manager dimulai...")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    
-    try:
-        # Initialize storage
-        print("📁 Menginisialisasi JSON storage...")
-        storage.ensure_data_dir()
-        storage.init_json_files()
-        print("✅ JSON storage berhasil diinisialisasi")
-        
-        # Test JSON operations
-        print("🔍 Testing JSON operations...")
-        test_data = storage.read_json(KATEGORI_FILE)
-        storage.write_json(KATEGORI_FILE, test_data)
-        print("✅ JSON operations working properly")
-        
-        # Initialize bot
-        print("🤖 Menginisialisasi bot...")
-        await bot.start(bot_token=BOT_TOKEN)
-        
-        # Get bot info
-        me = await bot.get_me()
-        print(f"✅ Bot berhasil login sebagai @{me.username}")
-        print(f"📊 Bot ID: {me.id}")
-        
-        # Show statistics
-        kategori_count = len(get_kategori())
-        akun_count = len(storage.read_json(AKUN_TG_FILE))
-        admin_count = len(get_all_admin_bots())
-        
-        print(f"📈 Statistik saat ini:")
-        print(f"   📁 Kategori: {kategori_count}")
-        print(f"   📱 Akun TG: {akun_count}")
-        print(f"   👨‍💼 Admin Bot: {admin_count}")
-        
-        print("🚀 Bot siap digunakan!")
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        
-        # Keep bot running
+    async with TelegramClient("bot", api_id, api_hash) as bot:
+        await bot.start(bot_token=bot_token)
+        print("🤖 Bot jalan...")
         await bot.run_until_disconnected()
-        
-    except Exception as e:
-        print(f"❌ Error saat inisialisasi bot: {e}")
-        import traceback
-        traceback.print_exc()
-        if bot and bot.is_connected():
-            await bot.disconnect()
 
 # ==================== HEALTH CHECK & BACKUP ====================
 def health_check():
@@ -1894,66 +1849,5 @@ def cleanup_old_backups(keep_days=7):
         print(f"❌ Cleanup error: {e}")
 
 # ==================== ENTRY POINT ====================
-if __name__ == '__main__':
-    import sys
-    
-    # Handle CLI arguments
-    if len(sys.argv) > 1:
-        command = sys.argv[1].lower()
-        
-        if command == 'health':
-            health_check()
-            sys.exit(0)
-        elif command == 'backup':
-            create_backup()
-            sys.exit(0)
-        elif command == 'stats':
-            kategori_count = len(get_kategori())
-            akun_count = len(storage.read_json(AKUN_TG_FILE))
-            admin_count = len(get_all_admin_bots())
-            
-            print("📈 Current Statistics:")
-            print(f"   📁 Categories: {kategori_count}")
-            print(f"   📱 TG Accounts: {akun_count}")
-            print(f"   👨‍💼 Bot Admins: {admin_count}")
-            sys.exit(0)
-        elif command == 'help':
-            print("Available commands:")
-            print("  python bot.py health  - Check JSON files health")
-            print("  python bot.py backup  - Create manual backup")
-            print("  python bot.py stats   - Show statistics")
-            print("  python bot.py         - Start bot (default)")
-            sys.exit(0)
-    
-    try:
-        # Run health check before starting
-        print("🏥 Running health check...")
-        if not health_check():
-            print("❌ Health check failed! Attempting to fix...")
-            try:
-                storage = JSONStorage()
-                print("✅ Storage reinitialized")
-            except Exception as e:
-                print(f"❌ Failed to reinitialize storage: {e}")
-                sys.exit(1)
-        
-        # Create backup
-        print("💾 Creating backup...")
-        create_backup()
-        
-        # Cleanup old backups
-        print("🧹 Cleaning up old backups...")
-        cleanup_old_backups()
-        
-        # Run bot
-        asyncio.run(main())
-        
-    except KeyboardInterrupt:
-        print("\n💤 Bot stopped by user")
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        print("👋 Terima kasih telah menggunakan Bot Telegram Manager!")
+if __name__ == "__main__":
+    asyncio.run(main())
