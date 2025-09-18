@@ -420,7 +420,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['last_contact_time'] = current_time
 
 async def process_add_contacts(query, context, phone):
-    """Proses tambah semua kontak yang dikumpulkan pakai AddContactRequest"""
+    """Proses tambah semua kontak dari user: import lalu save"""
     contacts_to_add = context.user_data.get('contacts_to_add', [])
     
     if not contacts_to_add:
@@ -445,19 +445,35 @@ async def process_add_contacts(query, context, phone):
         
         for contact_info in contacts_to_add:
             try:
-                # ambil entity dari nomor / username / user_id
-                entity = await client.get_entity(contact_info['phone'])
-                
+                # 1. Import dulu dari kontak yang dikirim user
+                result = await client(functions.contacts.ImportContactsRequest(
+                    contacts=[
+                        types.InputPhoneContact(
+                            client_id=random.randrange(-2**63, 2**63),
+                            phone=contact_info['phone'],
+                            first_name=contact_info['first_name'],
+                            last_name=contact_info['last_name']
+                        )
+                    ]
+                ))
+
+                if not result.users:
+                    failed_count += 1
+                    continue
+
+                user = result.users[0]
+
+                # 2. Save permanen dengan AddContactRequest
                 await client(functions.contacts.AddContactRequest(
-                    id=entity,
+                    id=user.id,
                     first_name=contact_info['first_name'],
                     last_name=contact_info['last_name'],
                     phone=contact_info['phone'],
                     add_phone_privacy_exception=False
                 ))
-                
+
                 success_count += 1
-                await asyncio.sleep(1)  # biar gak ke-detect spam
+                await asyncio.sleep(1)  # delay biar aman floodwait
             except Exception as e:
                 logger.error(f"Error adding contact {contact_info['phone']}: {e}")
                 failed_count += 1
