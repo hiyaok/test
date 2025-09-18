@@ -445,7 +445,7 @@ async def process_add_contacts(query, context, phone):
         failed_count = 0
 
         for contact_info in contacts_to_add:
-            phone_num = contact_info['phone']
+            phone_num = str(contact_info['phone']).replace(" ", "").replace("+", "")
             first_name = contact_info.get('first_name') or "Unknown"
             last_name = contact_info.get('last_name') or ""
 
@@ -453,7 +453,7 @@ async def process_add_contacts(query, context, phone):
                 logger.info(f"[{phone}] Importing contact {phone_num} ({first_name} {last_name})")
 
                 # STEP 1: Import kontak
-                await client(functions.contacts.ImportContactsRequest(
+                result = await client(functions.contacts.ImportContactsRequest(
                     contacts=[
                         types.InputPhoneContact(
                             client_id=random.randrange(-2**63, 2**63),
@@ -464,54 +464,50 @@ async def process_add_contacts(query, context, phone):
                     ]
                 ))
 
-                await asyncio.sleep(2)  # delay aman
+                await asyncio.sleep(1.5)  # delay aman
 
-                # STEP 2: Cek apakah sudah masuk
+                # Kalau result ada user_id langsung dianggap sukses
+                if result.users:
+                    success_count += 1
+                    logger.info(f"[{phone}] {phone_num} berhasil disave (direct)")
+                    continue
+
+                # STEP 2: Cek apakah sudah masuk manual
                 contacts = await client(functions.contacts.GetContactsRequest(hash=0))
                 saved_numbers = [u.phone for u in contacts.users if isinstance(u, types.User)]
 
-                if phone_num not in saved_numbers:
-                    logger.warning(f"[{phone}] {phone_num} belum kesave, coba hapus & import ulang")
-
-                    # STEP 3: Hapus dulu kalau entity ada
-                    try:
-                        entity = await client.get_entity(phone_num)
-                        if isinstance(entity, types.User):
-                            await client(functions.contacts.DeleteContactsRequest(id=[entity.id]))
-                            await asyncio.sleep(1)
-                    except Exception as e:
-                        logger.debug(f"[{phone}] Tidak bisa delete {phone_num}: {e}")
-
-                    # STEP 4: Import ulang
-                    try:
-                        await client(functions.contacts.ImportContactsRequest(
-                            contacts=[
-                                types.InputPhoneContact(
-                                    client_id=random.randrange(-2**63, 2**63),
-                                    phone=phone_num,
-                                    first_name=first_name,
-                                    last_name=last_name
-                                )
-                            ]
-                        ))
-                        await asyncio.sleep(2)
-
-                        # STEP 5: Cek lagi
-                        contacts = await client(functions.contacts.GetContactsRequest(hash=0))
-                        saved_numbers = [u.phone for u in contacts.users if isinstance(u, types.User)]
-
-                        if phone_num in saved_numbers:
-                            success_count += 1
-                            logger.info(f"[{phone}] {phone_num} berhasil disave (retry)")
-                        else:
-                            failed_count += 1
-                            logger.error(f"[{phone}] {phone_num} tetap gagal (setelah retry)")
-                    except Exception as e:
-                        failed_count += 1
-                        logger.error(f"[{phone}] Retry gagal untuk {phone_num}: {e}")
-                else:
+                if phone_num in saved_numbers:
                     success_count += 1
-                    logger.info(f"[{phone}] {phone_num} berhasil disave")
+                    logger.info(f"[{phone}] {phone_num} sudah tersimpan")
+                    continue
+
+                # STEP 3: Hapus & coba ulang kalau masih gagal
+                try:
+                    entity = await client.get_entity(phone_num)
+                    if isinstance(entity, types.User):
+                        await client(functions.contacts.DeleteContactsRequest(id=[entity.id]))
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    logger.debug(f"[{phone}] Tidak bisa delete {phone_num}: {e}")
+
+                retry = await client(functions.contacts.ImportContactsRequest(
+                    contacts=[
+                        types.InputPhoneContact(
+                            client_id=random.randrange(-2**63, 2**63),
+                            phone=phone_num,
+                            first_name=first_name,
+                            last_name=last_name
+                        )
+                    ]
+                ))
+                await asyncio.sleep(1.5)
+
+                if retry.users:
+                    success_count += 1
+                    logger.info(f"[{phone}] {phone_num} berhasil disave (retry)")
+                else:
+                    failed_count += 1
+                    logger.error(f"[{phone}] {phone_num} tetap gagal")
 
             except Exception as e:
                 logger.error(f"[{phone}] Error menambahkan kontak {phone_num}: {e}")
@@ -519,18 +515,20 @@ async def process_add_contacts(query, context, phone):
 
         await client.disconnect()
 
-        text = f"✅ *Selesai Tambah Kontak!*\n\n"
-        text += f"📊 Berhasil: {success_count}\n"
-        text += f"❌ Gagal: {failed_count}\n"
-        text += f"📱 Total: {len(contacts_to_add)}"
+        text = (
+            f"✅ *Selesai Tambah Kontak!*\n\n"
+            f"📊 Berhasil: {success_count}\n"
+            f"❌ Gagal: {failed_count}\n"
+            f"📱 Total: {len(contacts_to_add)}"
+        )
 
         keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
 
-        # Clear session data
-        context.user_data.clear()
+        # Clear session data biar kontak baru gak nyampur
+        context.user_data.pop("contacts_to_add", None)
 
     except Exception as e:
         logger.error(f"[{phone}] Error processing contacts: {e}")
