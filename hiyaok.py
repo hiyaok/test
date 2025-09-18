@@ -420,80 +420,122 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['last_contact_time'] = current_time
 
 async def process_add_contacts(query, context, phone):
-    """Proses tambah semua kontak dari user: import lalu save"""
+    """Proses tambah semua kontak yang dikumpulkan"""
     contacts_to_add = context.user_data.get('contacts_to_add', [])
-    
+
     if not contacts_to_add:
         keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text("❌ Gak ada kontak yang mau ditambahkan!", reply_markup=reply_markup)
         return
-    
+
     try:
         client = await tg_manager.create_client(phone)
         await client.connect()
-        
+
         if not await client.is_user_authorized():
             keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text("❌ Akun tidak authorized!", reply_markup=reply_markup)
             return
-        
+
         await query.edit_message_text(f"⏳ Menambahkan {len(contacts_to_add)} kontak...")
-        
-        success_count, failed_count = 0, 0
-        
+
+        success_count = 0
+        failed_count = 0
+
         for contact_info in contacts_to_add:
+            phone_num = contact_info['phone']
+            first_name = contact_info.get('first_name') or "Unknown"
+            last_name = contact_info.get('last_name') or ""
+
             try:
-                # 1. Import dulu dari kontak yang dikirim user
+                logger.info(f"[{phone}] Importing contact {phone_num} ({first_name} {last_name})")
+
+                # STEP 1: Import kontak
                 result = await client(functions.contacts.ImportContactsRequest(
                     contacts=[
                         types.InputPhoneContact(
                             client_id=random.randrange(-2**63, 2**63),
-                            phone=contact_info['phone'],
-                            first_name=contact_info['first_name'],
-                            last_name=contact_info['last_name']
+                            phone=phone_num,
+                            first_name=first_name,
+                            last_name=last_name
                         )
-                    ]
+                    ],
+                    replace=True
                 ))
 
-                if not result.users:
-                    failed_count += 1
-                    continue
+                await asyncio.sleep(2)  # delay aman
 
-                user = result.users[0]
+                # STEP 2: Cek apakah sudah masuk di kontak
+                contacts = await client(functions.contacts.GetContactsRequest(hash=0))
+                saved_numbers = [u.phone for u in contacts.users if isinstance(u, types.User)]
 
-                # 2. Save permanen dengan AddContactRequest
-                await client(functions.contacts.AddContactRequest(
-                    id=user.id,
-                    first_name=contact_info['first_name'],
-                    last_name=contact_info['last_name'],
-                    phone=contact_info['phone'],
-                    add_phone_privacy_exception=False
-                ))
+                if phone_num not in saved_numbers:
+                    logger.warning(f"[{phone}] Kontak {phone_num} belum kesave, coba hapus & import ulang")
 
-                success_count += 1
-                await asyncio.sleep(1)  # delay biar aman floodwait
+                    # STEP 3: Delete kalau ada user_id hasil resolve
+                    try:
+                        entity = await client.get_entity(phone_num)
+                        if isinstance(entity, types.User):
+                            await client(functions.contacts.DeleteContactsRequest(id=[entity.id]))
+                            await asyncio.sleep(1)
+                    except Exception as e:
+                        logger.debug(f"[{phone}] Tidak bisa delete {phone_num}: {e}")
+
+                    # STEP 4: Retry import sekali lagi
+                    try:
+                        await client(functions.contacts.ImportContactsRequest(
+                            contacts=[
+                                types.InputPhoneContact(
+                                    client_id=random.randrange(-2**63, 2**63),
+                                    phone=phone_num,
+                                    first_name=first_name,
+                                    last_name=last_name
+                                )
+                            ],
+                            replace=True
+                        ))
+                        await asyncio.sleep(2)
+
+                        # Cek ulang
+                        contacts = await client(functions.contacts.GetContactsRequest(hash=0))
+                        saved_numbers = [u.phone for u in contacts.users if isinstance(u, types.User)]
+
+                        if phone_num in saved_numbers:
+                            success_count += 1
+                            logger.info(f"[{phone}] Kontak {phone_num} berhasil disave (retry)")
+                        else:
+                            failed_count += 1
+                            logger.error(f"[{phone}] Kontak {phone_num} tetap gagal disave (setelah retry)")
+                    except Exception as e:
+                        failed_count += 1
+                        logger.error(f"[{phone}] Retry gagal untuk {phone_num}: {e}")
+                else:
+                    success_count += 1
+                    logger.info(f"[{phone}] Kontak {phone_num} berhasil disave")
+
             except Exception as e:
-                logger.error(f"Error adding contact {contact_info['phone']}: {e}")
+                logger.error(f"[{phone}] Error menambahkan kontak {phone_num}: {e}")
                 failed_count += 1
-        
+
         await client.disconnect()
-        
+
         text = f"✅ *Selesai Tambah Kontak!*\n\n"
         text += f"📊 Berhasil: {success_count}\n"
         text += f"❌ Gagal: {failed_count}\n"
         text += f"📱 Total: {len(contacts_to_add)}"
-        
+
         keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
-        
+
+        # Clear session data
         context.user_data.clear()
-        
+
     except Exception as e:
-        logger.error(f"Error processing contacts: {e}")
+        logger.error(f"[{phone}] Error processing contacts: {e}")
         keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
