@@ -1770,7 +1770,7 @@ async def error_handler(event):
 # ==================== MAIN FUNCTION ====================
 async def main():
     async with TelegramClient("bot", API_ID, API_HASH) as bot:
-        await bot.start(bot_token=bot_token)
+        await bot.start(bot_token=BOT_TOKEN)
         print("🤖 Bot jalan...")
         await bot.run_until_disconnected()
 
