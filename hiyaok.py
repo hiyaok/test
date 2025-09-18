@@ -165,6 +165,17 @@ def add_kategori(nama: str) -> bool:
     data.append(new_kategori)
     return storage.write_json(KATEGORI_FILE, data)
 
+def create_user_state(action, **kwargs):
+    """Create user state with timestamp"""
+    state = {"action": action, "created_at": time.time()}
+    state.update(kwargs)
+    return state
+
+def set_user_state(user_id, action, **kwargs):
+    """Set user state with proper tracking"""
+    user_states[user_id] = create_user_state(action, **kwargs)
+    update_stats('active_sessions', len(user_states) - bot_stats.get('active_sessions', 0))
+
 def update_kategori(kategori_id: int, nama_baru: str) -> bool:
     data = storage.read_json(KATEGORI_FILE)
     nama_baru = nama_baru.strip()
@@ -363,16 +374,42 @@ user_states = {}
 active_clients = {}  # Store active client connections
 
 async def cleanup_client(user_id: int):
-    """Clean up client connection"""
+    """Clean up client connection with better error handling"""
     if user_id in active_clients:
         try:
             client = active_clients[user_id]
-            if client.is_connected():
+            if hasattr(client, 'is_connected') and client.is_connected():
                 await client.disconnect()
+            logger.info(f"Client disconnected for user {user_id}")
         except Exception as e:
             logger.error(f"Error disconnecting client for user {user_id}: {e}")
         finally:
             active_clients.pop(user_id, None)
+    
+    # Also clean up user state if exists
+    user_states.pop(user_id, None)
+
+async def cleanup_expired_states():
+    """Clean up expired user states"""
+    while True:
+        try:
+            await asyncio.sleep(30 * 60)  # Every 30 minutes
+            
+            current_time = time.time()
+            expired_users = []
+            
+            for user_id, state in user_states.items():
+                # Check if state is older than 1 hour
+                state_time = state.get('created_at', current_time)
+                if current_time - state_time > 3600:  # 1 hour
+                    expired_users.append(user_id)
+            
+            for user_id in expired_users:
+                await cleanup_client(user_id)
+                logger.info(f"Cleaned up expired state for user {user_id}")
+                
+        except Exception as e:
+            logger.error(f"Error in cleanup_expired_states: {e}")
 
 # ==================== MAIN HANDLERS ====================
 @bot.on(events.NewMessage(pattern='/start'))
@@ -1502,9 +1539,16 @@ async def message_handler(event):
     user_id = event.sender_id
     
     if user_id not in user_states:
+        # Handle perintah tidak dikenal
+        msg = "❌ **Perintah tidak dikenali!**\n\n" + \
+              "Gunakan tombol yang tersedia atau ketik /start untuk kembali ke menu utama."
+        await safe_send_message(event, msg)
         return
     
     state = user_states[user_id]
+    
+    # Update stats
+    update_stats('total_commands')
     
     # Handle Login Steps
     if state["action"] == "login_step1":
@@ -1541,6 +1585,7 @@ async def message_handler(event):
             user_states.pop(user_id, None)
         except Exception as e:
             logger.error(f"Error in login step 1: {e}")
+            update_stats('errors')
             await safe_send_message(event, f"❌ **Error:** {str(e)}")
             user_states.pop(user_id, None)
     
@@ -1583,6 +1628,7 @@ async def message_handler(event):
             await safe_send_message(event, f"❌ **Flood wait!** Tunggu {e.seconds} detik lagi.")
         except Exception as e:
             logger.error(f"Error in login step 2: {e}")
+            update_stats('errors')
             await safe_send_message(event, f"❌ **Error:** {str(e)}")
             await cleanup_client(user_id)
             user_states.pop(user_id, None)
@@ -1618,29 +1664,44 @@ async def message_handler(event):
             await safe_send_message(event, f"❌ **Flood wait!** Tunggu {e.seconds} detik lagi.")
         except Exception as e:
             logger.error(f"Error in login password step: {e}")
+            update_stats('errors')
             await safe_send_message(event, f"❌ **Error:** {str(e)}")
             await cleanup_client(user_id)
             user_states.pop(user_id, None)
     
-    # Handle Tambah Kontak
+    # Handle Tambah Kontak - PERBAIKAN UTAMA DI SINI
     elif state["action"] == "tambah_kontak_step1":
         if event.message.contact:
+            # Handle contact message
             contact_data = {
                 "phone": event.message.contact.phone_number,
-                "first_name": event.message.contact.first_name,
-                "last_name": event.message.contact.last_name
+                "first_name": event.message.contact.first_name or "Unknown",
+                "last_name": event.message.contact.last_name or ""
             }
+            
+            # Ensure contacts list exists
+            if "contacts" not in state:
+                state["contacts"] = []
+            
             state["contacts"].append(contact_data)
+            user_states[user_id] = state  # Update state
             
             count = len(state["contacts"])
             msg = f"✅ **Kontak ke-{count} berhasil ditambahkan!**\n\n"
-            msg += f"👤 **Nama:** {contact_data['first_name']} {contact_data['last_name'] or ''}\n"
+            msg += f"👤 **Nama:** {contact_data['first_name']} {contact_data['last_name']}\n"
             msg += f"📞 **Nomor:** +{contact_data['phone']}\n\n"
             msg += "Kirim kontak lain atau ketik `/done` jika sudah selesai."
             
             await safe_send_message(event, msg)
         else:
-            await safe_send_message(event, "❌ **Kirim kontak yang valid!** Bukan text biasa.")
+            # Handle text message in contact mode
+            text = event.message.text.strip()
+            if text.lower() in ['/done', 'done', 'selesai']:
+                # Process done command
+                await done_handler(event)
+                return
+            else:
+                await safe_send_message(event, "❌ **Kirim kontak yang valid!** Bukan text biasa.\n\nAtau ketik `/done` jika sudah selesai menambah kontak.")
     
     # Handle Tambah Admin
     elif state["action"] == "tambah_admin":
@@ -1656,6 +1717,7 @@ async def message_handler(event):
         # Check if already admin
         if is_admin_utama(new_admin_id) or is_admin_bot(new_admin_id):
             await safe_send_message(event, "❌ **User ini sudah jadi admin!**")
+            user_states.pop(user_id, None)
             return
         
         # Add to database
@@ -1667,7 +1729,7 @@ async def message_handler(event):
             except:
                 await safe_send_message(event, f"✅ **User ID {new_admin_id}** berhasil ditambahkan sebagai admin bot!")
         else:
-            await safe_send_message(event, "❌ **User ini sudah jadi admin!**")
+            await safe_send_message(event, "❌ **Gagal menambahkan admin!**")
         
         user_states.pop(user_id, None)
     
@@ -1679,20 +1741,19 @@ async def message_handler(event):
             return
         
         if add_kategori(nama_kategori):
+            buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
             msg = format_message("KATEGORI BERHASIL DIBUAT", 
                                f"Kategori **{nama_kategori}** telah dibuat!",
                                success=True)
-            await safe_send_message(event, msg)
+            await safe_send_message(event, msg, buttons)
             
-            # Continue with previous flow if needed
-            if user_id in user_states:
-                previous_state = user_states[user_id]
-                if "login_step3_pilih_kategori" in str(previous_state.get("action", "")):
-                    await show_kategori_selection(event, "Pilih kategori untuk nomor ini:")
-                    return
-                elif "tambah_kontak_step2_pilih_kategori" in str(previous_state.get("action", "")):
-                    await show_kategori_selection(event, "Pilih kategori akun yang ingin digunakan:")
-                    return
+            # Check for continuation flow
+            if user_id in user_states and "login_step3" in str(user_states[user_id].get("action", "")):
+                await show_kategori_selection(event, "Pilih kategori untuk nomor ini:")
+                return
+            elif user_id in user_states and "tambah_kontak_step2" in str(user_states[user_id].get("action", "")):
+                await show_kategori_selection(event, "Pilih kategori akun yang ingin digunakan:")
+                return
         else:
             await safe_send_message(event, "❌ **Nama kategori sudah ada!** Gunakan nama yang lain.")
             return
@@ -1737,6 +1798,12 @@ async def message_handler(event):
             nomor = akun['nomor']
             session_string = akun['session_string']
             
+            # Show processing message
+            processing_msg = await safe_send_message(event, format_message(
+                "MEMPROSES...", 
+                f"Menghubungkan ke akun {nomor} dan mencari grup/channel..."
+            ))
+            
             # Connect with the account
             client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
             await client.connect()
@@ -1744,9 +1811,10 @@ async def message_handler(event):
             # Get the target entity (group/channel)
             try:
                 target_entity = await client.get_entity(grup_input)
-            except Exception:
-                await safe_send_message(event, "❌ **Grup/Channel tidak ditemukan!** Cek lagi username atau link nya.")
+            except Exception as e:
                 await client.disconnect()
+                await safe_send_message(event, "❌ **Grup/Channel tidak ditemukan!** Cek lagi username atau link nya.")
+                user_states.pop(user_id, None)
                 return
             
             # Get all contacts
@@ -1758,15 +1826,19 @@ async def message_handler(event):
                 user_states.pop(user_id, None)
                 return
             
-            # Invite contacts to the group/channel
+            # Start inviting contacts
             success_count = 0
             failed_count = 0
             total_count = len(contacts.users)
             
-            msg_status = await safe_send_message(event, format_message(
-                "PROSES INVITE...", 
-                f"Mulai invite {total_count} kontak ke grup/channel..."
-            ))
+            # Update processing message
+            try:
+                await processing_msg.edit(format_message(
+                    "PROSES INVITE DIMULAI", 
+                    f"Mulai invite {total_count} kontak ke {target_entity.title if hasattr(target_entity, 'title') else grup_input}..."
+                ))
+            except:
+                pass
             
             for i, user in enumerate(contacts.users):
                 try:
@@ -1777,21 +1849,21 @@ async def message_handler(event):
                     
                     success_count += 1
                     
-                    # Update progress every 5 invites
-                    if (i + 1) % 5 == 0:
+                    # Update progress every 10 invites
+                    if (i + 1) % 10 == 0:
                         try:
                             progress_msg = format_message(
                                 "PROSES INVITE...", 
                                 f"Progress: {i + 1}/{total_count}\n" +
-                                f"Berhasil: {success_count}\n" +
-                                f"Gagal: {failed_count}"
+                                f"✅ Berhasil: {success_count}\n" +
+                                f"❌ Gagal: {failed_count}"
                             )
-                            await safe_edit_message(msg_status, progress_msg)
+                            await processing_msg.edit(progress_msg)
                         except:
                             pass  # Ignore edit errors during progress updates
                         
                         # Add delay to avoid flood limits
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(5)
                 
                 except (UserPrivacyRestrictedError, UserAlreadyParticipantError):
                     failed_count += 1
@@ -1799,6 +1871,7 @@ async def message_handler(event):
                 except PeerFloodError:
                     logger.warning("PeerFloodError encountered, stopping invites")
                     failed_count += (total_count - i - 1)
+                    await safe_send_message(event, "⚠️ **Akun terkena limit flood!** Proses dihentikan untuk menghindari banned.")
                     break
                 except FloodWaitError as e:
                     logger.warning(f"FloodWait during invite: {e.seconds} seconds")
@@ -1820,28 +1893,35 @@ async def message_handler(event):
             
             # Final result
             buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-            msg = format_message(
+            final_msg = format_message(
                 "INVITE SELESAI", 
                 f"**Akun:** {nomor}\n"
                 f"**Target:** {target_entity.title if hasattr(target_entity, 'title') else grup_input}\n"
-                f"**Berhasil di-invite:** {success_count}/{total_count} kontak\n"
-                f"**Gagal:** {failed_count} kontak\n\n"
+                f"**✅ Berhasil:** {success_count}/{total_count} kontak\n"
+                f"**❌ Gagal:** {failed_count} kontak\n\n"
                 "Proses invite sudah selesai!",
-                success=True
+                success=True if success_count > 0 else False
             )
             try:
-                await safe_edit_message(msg_status, msg, buttons)
+                await processing_msg.edit(final_msg, buttons=buttons)
             except:
-                await safe_send_message(event, msg, buttons)
+                await safe_send_message(event, final_msg, buttons)
             
         except Exception as e:
             logger.error(f"Error in invite process: {e}")
+            update_stats('errors')
             await safe_send_message(event, f"❌ **Error:** {str(e)}")
         finally:
             user_states.pop(user_id, None)
+    
+    else:
+        # Handle unknown state
+        msg = "❌ **State tidak dikenali!** Silakan ketik /start untuk kembali ke menu utama."
+        await safe_send_message(event, msg)
+        user_states.pop(user_id, None)
 
 # Done Command Handler
-@bot.on(events.NewMessage(pattern='/done'))
+@bot.on(events.NewMessage(pattern=r'^/done$|^done$|^selesai$'))
 async def done_handler(event):
     if not is_authorized(event.sender_id):
         return
@@ -1849,12 +1929,13 @@ async def done_handler(event):
     user_id = event.sender_id
     
     if user_id not in user_states:
+        await safe_send_message(event, "❌ **Tidak ada proses aktif yang bisa diselesaikan.**")
         return
     
     state = user_states[user_id]
     
     if state["action"] == "tambah_kontak_step1":
-        if not state["contacts"]:
+        if "contacts" not in state or not state["contacts"]:
             await safe_send_message(event, "❌ **Belum ada kontak yang ditambahkan!**")
             return
         
@@ -1870,27 +1951,34 @@ async def done_handler(event):
         message_text += "Sekarang pilih kategori akun yang ingin digunakan untuk menyimpan kontak:"
         
         await show_kategori_selection(event, message_text)
+    else:
+        await safe_send_message(event, "❌ **Perintah /done tidak berlaku untuk aksi saat ini.**")
 
 # Helper function to show kategori selection
 async def show_kategori_selection(event, message_text):
-    kategori_list = get_kategori()
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"pilih_kategori_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("➕ Buat Kategori Baru", b"buat_kategori_baru")])
-    
-    if not kategori_list:
-        message_text = "Belum ada kategori yang dibuat.\n\nBuat kategori baru dulu:"
-        buttons = [[Button.inline("➕ Buat Kategori Baru", b"buat_kategori_baru")]]
-    
-    msg = format_message("PILIH KATEGORI", message_text)
-    
-    if hasattr(event, 'edit'):
-        await safe_edit_message(event, msg, buttons)
-    else:
-        await safe_send_message(event, msg, buttons)
+    """Show kategori selection with proper error handling"""
+    try:
+        kategori_list = get_kategori()
+        
+        buttons = []
+        if kategori_list:
+            for kat_id, kat_nama in kategori_list:
+                buttons.append([Button.inline(f"📁 {kat_nama}", f"pilih_kategori_{kat_id}".encode())])
+        
+        buttons.append([Button.inline("➕ Buat Kategori Baru", b"buat_kategori_baru")])
+        
+        if not kategori_list:
+            message_text = "Belum ada kategori yang dibuat.\n\nBuat kategori baru dulu:"
+        
+        msg = format_message("PILIH KATEGORI", message_text)
+        
+        if hasattr(event, 'edit'):
+            await safe_edit_message(event, msg, buttons)
+        else:
+            await safe_send_message(event, msg, buttons)
+    except Exception as e:
+        logger.error(f"Error in show_kategori_selection: {e}")
+        await safe_send_message(event, "❌ Error menampilkan kategori. Silakan coba lagi.")
 
 # ==================== ERROR HANDLER ====================
 @bot.on(events.NewMessage)
@@ -2125,9 +2213,32 @@ bot_stats = {
 }
 
 def update_stats(stat_name, increment=1):
-    """Update bot statistics"""
-    if stat_name in bot_stats:
-        bot_stats[stat_name] += increment
+    """Update bot statistics with error handling"""
+    try:
+        if stat_name in bot_stats:
+            bot_stats[stat_name] += increment
+        
+        # Update user count
+        if stat_name == 'total_commands':
+            bot_stats['active_sessions'] = len(active_clients)
+            
+    except Exception as e:
+        logger.error(f"Error updating stats: {e}")
+
+def safe_handler(func):
+    """Decorator for safe event handling"""
+    async def wrapper(event):
+        try:
+            await func(event)
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {e}")
+            update_stats('errors')
+            try:
+                if is_authorized(event.sender_id):
+                    await event.reply("❌ Terjadi error. Silakan coba lagi atau hubungi admin.")
+            except:
+                pass  # If we can't send error message, just log it
+    return wrapper
 
 def get_bot_stats():
     """Get current bot statistics"""
@@ -2152,6 +2263,11 @@ async def stats_handler(event):
     
     stats_msg = get_bot_stats()
     await safe_send_message(event, stats_msg)
+
+@safe_handler
+@bot.on(events.NewMessage(pattern='/start'))
+async def safe_start_handler(event):
+    await start_handler(event)
 
 # Add restart command for admin
 @bot.on(events.NewMessage(pattern='/restart'))
@@ -2206,6 +2322,7 @@ async def main():
         # Start background tasks
         asyncio.create_task(periodic_backup())
         asyncio.create_task(periodic_cleanup())
+        asyncio.create_task(cleanup_expired_states())  # ADD THIS LINE
         
         print("✅ Background tasks started")
         print("🎯 Bot is ready to receive messages!")
@@ -2264,51 +2381,3 @@ def install_requirements():
             print(f"✅ {package} installed successfully")
         except subprocess.CalledProcessError:
             print(f"❌ Failed to install {package}")
-
-# Uncomment the line below if you want to auto-install requirements
-# install_requirements()
-
-"""
-INSTALLATION GUIDE:
-1. Install Python 3.8+
-2. Install required packages:
-   pip install telethon
-
-3. Update configuration:
-   - API_ID: Your Telegram API ID
-   - API_HASH: Your Telegram API Hash
-   - BOT_TOKEN: Your bot token from @BotFather
-   - ADMIN_UTAMA: Your Telegram user ID
-
-4. Run the bot:
-   python bot.py
-
-FEATURES:
-✅ Multi-account Telegram management
-✅ Category-based organization
-✅ Contact management (add/clear)
-✅ Group/Channel invitation
-✅ Admin management system
-✅ Automatic backups
-✅ Error handling and recovery
-✅ Session management
-✅ Flood protection
-✅ Statistics and monitoring
-✅ Graceful shutdown
-
-SECURITY FEATURES:
-🔐 Authorization system
-🔐 Admin permissions
-🔐 Session string protection
-🔐 Error logging
-🔐 Rate limiting
-🔐 Data backup and recovery
-
-TROUBLESHOOTING:
-- If bot doesn't respond: Check bot token and permissions
-- If login fails: Check API credentials and phone number format
-- If invites fail: Check account limits and group/channel permissions
-- If database errors: Check file permissions and storage space
-
-For support, check the logs in bot_data/bot.log
-"""
