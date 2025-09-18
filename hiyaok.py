@@ -1,609 +1,751 @@
+#!/usr/bin/env python3
+"""
+Telegram Bot Manager - Enhanced Version
+Bot untuk mengelola multiple akun Telegram dengan Telethon
+"""
+
 import asyncio
 import json
 import os
-from datetime import datetime
-from typing import Dict, List, Optional, Any
+import logging
 import threading
+import time
+import shutil
+from datetime import datetime
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, asdict
+from contextlib import asynccontextmanager
+
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import InputPhoneContact, User, Chat, Channel
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PasswordHashInvalidError
-from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest, GetContactsRequest
+from telethon.errors import (
+    SessionPasswordNeededError, PhoneCodeInvalidError, 
+    PasswordHashInvalidError, FloodWaitError, PhoneNumberInvalidError
+)
+from telethon.tl.functions.contacts import (
+    ImportContactsRequest, DeleteContactsRequest, GetContactsRequest
+)
 from telethon.tl.functions.channels import InviteToChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
 
-# Konfigurasi Bot
-API_ID = "20755791"
-API_HASH = "3d09356fe14a31a5baaad296a1abef80"
-BOT_TOKEN = "8426128734:AAHYVpJCy7LrofTI3AzyUNhB_42hQnVNwiA"
+# ==================== CONFIGURATION ====================
+@dataclass
+class BotConfig:
+    """Konfigurasi Bot"""
+    API_ID: str = "20755791"
+    API_HASH: str = "3d09356fe14a31a5baaad296a1abef80"
+    BOT_TOKEN: str = "8426128734:AAHYVpJCy7LrofTI3AzyUNhB_42hQnVNwiA"
+    ADMIN_UTAMA: int = 5988451717
+    DATA_DIR: str = "bot_data"
+    BACKUP_RETENTION_DAYS: int = 7
+    MAX_RETRY_ATTEMPTS: int = 3
+    FLOOD_WAIT_TIMEOUT: int = 60
 
-# Admin Configuration
-ADMIN_UTAMA = 5988451717
-ADMIN_BOTS = []
+config = BotConfig()
 
-# JSON Storage Configuration
-DATA_DIR = "bot_data"
-KATEGORI_FILE = os.path.join(DATA_DIR, "kategori.json")
-AKUN_TG_FILE = os.path.join(DATA_DIR, "akun_tg.json")
-TEMP_CONTACTS_FILE = os.path.join(DATA_DIR, "temp_contacts.json")
-ADMIN_BOTS_FILE = os.path.join(DATA_DIR, "admin_bots.json")
-
-# Thread lock untuk file operations
-file_lock = threading.Lock()
-
-class JSONStorage:
-    """Thread-safe JSON storage manager"""
+# ==================== LOGGING SETUP ====================
+def setup_logging():
+    """Setup logging configuration"""
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        handlers=[
+            logging.FileHandler(os.path.join(config.DATA_DIR, 'bot.log')),
+            logging.StreamHandler()
+        ]
+    )
     
-    def __init__(self):
-        self.ensure_data_dir()
-        self.init_json_files()
+    # Suppress telethon debug logs
+    logging.getLogger('telethon').setLevel(logging.WARNING)
     
-    def ensure_data_dir(self):
-        """Pastikan direktori data ada"""
-        if not os.path.exists(DATA_DIR):
-            os.makedirs(DATA_DIR)
+    return logging.getLogger(__name__)
+
+# ==================== DATA MODELS ====================
+@dataclass
+class Kategori:
+    id: int
+    nama: str
+    created_at: str
+
+@dataclass
+class AkunTG:
+    id: int
+    nomor: str
+    session_string: str
+    kategori_id: int
+    nama_akun: str = ""
+    created_at: str = ""
+    is_active: bool = True
+
+@dataclass
+class AdminBot:
+    user_id: int
+    added_by: int
+    added_at: str
+
+@dataclass
+class TempContact:
+    user_id: int
+    contact_data: Dict
+    created_at: str
+
+# ==================== STORAGE MANAGER ====================
+class StorageManager:
+    """Thread-safe JSON storage manager dengan error handling yang lebih baik"""
     
-    def init_json_files(self):
-        """Inisialisasi file JSON jika belum ada"""
-        default_data = {
-            KATEGORI_FILE: [],
-            AKUN_TG_FILE: [],
-            TEMP_CONTACTS_FILE: [],
-            ADMIN_BOTS_FILE: []
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        self.file_lock = threading.RLock()  # Reentrant lock
+        self.logger = logging.getLogger(self.__class__.__name__)
+        
+        # File paths
+        self.files = {
+            'kategori': os.path.join(data_dir, 'kategori.json'),
+            'akun_tg': os.path.join(data_dir, 'akun_tg.json'),
+            'temp_contacts': os.path.join(data_dir, 'temp_contacts.json'),
+            'admin_bots': os.path.join(data_dir, 'admin_bots.json')
         }
         
-        for file_path, default_content in default_data.items():
-            if not os.path.exists(file_path):
-                self.write_json(file_path, default_content)
+        self._ensure_setup()
     
-    def read_json(self, file_path: str) -> List[Dict]:
-        """Baca data dari file JSON dengan thread safety"""
-        with file_lock:
-            try:
+    def _ensure_setup(self):
+        """Pastikan direktori dan file ada"""
+        try:
+            if not os.path.exists(self.data_dir):
+                os.makedirs(self.data_dir)
+                self.logger.info(f"Created data directory: {self.data_dir}")
+            
+            # Initialize files with empty lists
+            for file_type, file_path in self.files.items():
                 if not os.path.exists(file_path):
+                    self._write_json(file_path, [])
+                    self.logger.info(f"Initialized {file_type} file")
+                    
+        except Exception as e:
+            self.logger.error(f"Error during setup: {e}")
+            raise
+    
+    def _read_json(self, file_path: str) -> List[Dict]:
+        """Internal method untuk membaca JSON dengan error handling"""
+        try:
+            if not os.path.exists(file_path):
+                return []
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if not content:
                     return []
+                    
+                data = json.loads(content)
+                return data if isinstance(data, list) else []
                 
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data if isinstance(data, list) else []
-            except (json.JSONDecodeError, FileNotFoundError):
-                return []
-            except Exception as e:
-                print(f"Error reading {file_path}: {e}")
-                return []
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON decode error in {file_path}: {e}")
+            # Try to restore from backup
+            backup_path = file_path + '.backup'
+            if os.path.exists(backup_path):
+                self.logger.info(f"Restoring from backup: {backup_path}")
+                shutil.copy2(backup_path, file_path)
+                return self._read_json(file_path)
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"Error reading {file_path}: {e}")
+            return []
     
-    def write_json(self, file_path: str, data: List[Dict]) -> bool:
-        """Tulis data ke file JSON dengan thread safety"""
-        with file_lock:
-            try:
-                # Create backup
-                backup_path = file_path + '.backup'
+    def _write_json(self, file_path: str, data: List[Dict]) -> bool:
+        """Internal method untuk menulis JSON dengan backup"""
+        try:
+            # Create backup
+            if os.path.exists(file_path):
+                shutil.copy2(file_path, file_path + '.backup')
+            
+            # Write data
+            temp_path = file_path + '.tmp'
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            # Atomic rename
+            if os.name == 'nt':  # Windows
                 if os.path.exists(file_path):
-                    import shutil
-                    shutil.copy2(file_path, backup_path)
+                    os.remove(file_path)
+            os.rename(temp_path, file_path)
+            
+            # Remove backup if write successful
+            backup_path = file_path + '.backup'
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
                 
-                # Write new data
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                
-                # Remove backup if write successful
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error writing {file_path}: {e}")
+            # Restore from backup if exists
+            backup_path = file_path + '.backup'
+            if os.path.exists(backup_path):
+                shutil.copy2(backup_path, file_path)
                 if os.path.exists(backup_path):
                     os.remove(backup_path)
-                
-                return True
-            except Exception as e:
-                print(f"Error writing {file_path}: {e}")
-                # Restore backup if exists
-                backup_path = file_path + '.backup'
-                if os.path.exists(backup_path):
-                    import shutil
-                    shutil.copy2(backup_path, file_path)
-                    os.remove(backup_path)
-                return False
+            return False
     
-    def get_next_id(self, file_path: str) -> int:
-        """Generate ID berikutnya untuk data"""
-        data = self.read_json(file_path)
+    def read_json(self, file_type: str) -> List[Dict]:
+        """Public method untuk membaca data dengan thread safety"""
+        with self.file_lock:
+            file_path = self.files.get(file_type)
+            if not file_path:
+                raise ValueError(f"Unknown file type: {file_type}")
+            return self._read_json(file_path)
+    
+    def write_json(self, file_type: str, data: List[Dict]) -> bool:
+        """Public method untuk menulis data dengan thread safety"""
+        with self.file_lock:
+            file_path = self.files.get(file_type)
+            if not file_path:
+                raise ValueError(f"Unknown file type: {file_type}")
+            return self._write_json(file_path, data)
+    
+    def get_next_id(self, file_type: str) -> int:
+        """Generate ID berikutnya"""
+        data = self.read_json(file_type)
         if not data:
             return 1
-        
         max_id = max([item.get('id', 0) for item in data], default=0)
         return max_id + 1
-
-# Initialize storage
-storage = JSONStorage()
-
-# Helper Functions untuk Kategori
-def get_kategori() -> List[tuple]:
-    """Get semua kategori"""
-    data = storage.read_json(KATEGORI_FILE)
-    return [(item['id'], item['nama']) for item in data]
-
-def add_kategori(nama: str) -> bool:
-    """Tambah kategori baru"""
-    data = storage.read_json(KATEGORI_FILE)
     
-    # Check duplicate
-    if any(item['nama'].lower() == nama.lower() for item in data):
-        return False
-    
-    new_kategori = {
-        'id': storage.get_next_id(KATEGORI_FILE),
-        'nama': nama,
-        'created_at': datetime.now().isoformat()
-    }
-    
-    data.append(new_kategori)
-    return storage.write_json(KATEGORI_FILE, data)
-
-def update_kategori(kategori_id: int, nama_baru: str) -> bool:
-    """Update nama kategori"""
-    data = storage.read_json(KATEGORI_FILE)
-    
-    # Check duplicate (exclude current)
-    if any(item['nama'].lower() == nama_baru.lower() and item['id'] != kategori_id for item in data):
-        return False
-    
-    for item in data:
-        if item['id'] == kategori_id:
-            item['nama'] = nama_baru
-            return storage.write_json(KATEGORI_FILE, data)
-    
-    return False
-
-def get_kategori_by_id(kategori_id: int) -> Optional[Dict]:
-    """Get kategori by ID"""
-    data = storage.read_json(KATEGORI_FILE)
-    return next((item for item in data if item['id'] == kategori_id), None)
-
-# Helper Functions untuk Akun TG
-def get_akun_by_kategori(kategori_id: int) -> List[tuple]:
-    """Get akun berdasarkan kategori"""
-    data = storage.read_json(AKUN_TG_FILE)
-    filtered_data = [item for item in data if item['kategori_id'] == kategori_id]
-    return [(item['id'], item['nomor'], item.get('nama_akun', '')) for item in filtered_data]
-
-def add_akun_tg(nomor: str, session_string: str, kategori_id: int, nama_akun: str = '') -> bool:
-    """Tambah akun TG baru"""
-    data = storage.read_json(AKUN_TG_FILE)
-    
-    # Check duplicate
-    if any(item['nomor'] == nomor for item in data):
-        return False
-    
-    new_akun = {
-        'id': storage.get_next_id(AKUN_TG_FILE),
-        'nomor': nomor,
-        'session_string': session_string,
-        'kategori_id': kategori_id,
-        'nama_akun': nama_akun,
-        'created_at': datetime.now().isoformat()
-    }
-    
-    data.append(new_akun)
-    return storage.write_json(AKUN_TG_FILE, data)
-
-def get_akun_by_id(akun_id: int) -> Optional[Dict]:
-    """Get akun by ID"""
-    data = storage.read_json(AKUN_TG_FILE)
-    return next((item for item in data if item['id'] == akun_id), None)
-
-def delete_akun_by_id(akun_id: int) -> bool:
-    """Hapus akun by ID"""
-    data = storage.read_json(AKUN_TG_FILE)
-    original_length = len(data)
-    data = [item for item in data if item['id'] != akun_id]
-    
-    if len(data) < original_length:
-        return storage.write_json(AKUN_TG_FILE, data)
-    return False
-
-def update_akun_kategori(akun_id: int, new_kategori_id: int) -> bool:
-    """Update kategori akun"""
-    data = storage.read_json(AKUN_TG_FILE)
-    
-    for item in data:
-        if item['id'] == akun_id:
-            item['kategori_id'] = new_kategori_id
-            return storage.write_json(AKUN_TG_FILE, data)
-    
-    return False
-
-# Helper Functions untuk Temp Contacts
-def add_temp_contact(user_id: int, contact_data: Dict) -> bool:
-    """Tambah temporary contact"""
-    data = storage.read_json(TEMP_CONTACTS_FILE)
-    
-    new_contact = {
-        'user_id': user_id,
-        'contact_data': contact_data,
-        'created_at': datetime.now().isoformat()
-    }
-    
-    data.append(new_contact)
-    return storage.write_json(TEMP_CONTACTS_FILE, data)
-
-def get_temp_contacts(user_id: int) -> List[Dict]:
-    """Get temporary contacts by user ID"""
-    data = storage.read_json(TEMP_CONTACTS_FILE)
-    return [item['contact_data'] for item in data if item['user_id'] == user_id]
-
-def clear_temp_contacts(user_id: int) -> bool:
-    """Clear temporary contacts by user ID"""
-    data = storage.read_json(TEMP_CONTACTS_FILE)
-    original_length = len(data)
-    data = [item for item in data if item['user_id'] != user_id]
-    
-    if len(data) < original_length:
-        return storage.write_json(TEMP_CONTACTS_FILE, data)
-    return True
-
-# Helper Functions untuk Admin Bots
-def is_admin_utama(user_id: int) -> bool:
-    return user_id == ADMIN_UTAMA
-
-def is_admin_bot(user_id: int) -> bool:
-    data = storage.read_json(ADMIN_BOTS_FILE)
-    return any(item['user_id'] == user_id for item in data)
-
-def is_authorized(user_id: int) -> bool:
-    return is_admin_utama(user_id) or is_admin_bot(user_id)
-
-def add_admin_bot(user_id: int, added_by: int) -> bool:
-    """Tambah admin bot"""
-    data = storage.read_json(ADMIN_BOTS_FILE)
-    
-    # Check duplicate
-    if any(item['user_id'] == user_id for item in data):
-        return False
-    
-    new_admin = {
-        'user_id': user_id,
-        'added_by': added_by,
-        'added_at': datetime.now().isoformat()
-    }
-    
-    data.append(new_admin)
-    return storage.write_json(ADMIN_BOTS_FILE, data)
-
-def get_all_admin_bots() -> List[tuple]:
-    """Get semua admin bots"""
-    data = storage.read_json(ADMIN_BOTS_FILE)
-    return [(item['user_id'], item['added_at']) for item in data]
-
-def delete_admin_bot(user_id: int) -> bool:
-    """Hapus admin bot"""
-    data = storage.read_json(ADMIN_BOTS_FILE)
-    original_length = len(data)
-    data = [item for item in data if item['user_id'] != user_id]
-    
-    if len(data) < original_length:
-        return storage.write_json(ADMIN_BOTS_FILE, data)
-    return False
-
-# Utility Functions
-def format_message(title: str, content: str = "", buttons: List = None) -> str:
-    """Format pesan dengan style yang keren"""
-    msg = f"━━━━━━━━━━━━━━━━━━\n"
-    msg += f"🤖 **{title}** 🤖\n"
-    msg += f"━━━━━━━━━━━━━━━━━━\n"
-    if content:
-        msg += f"{content}\n"
-    return msg
-
-# Initialize Bot
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-
-# State Management
-user_states = {}
-
-@bot.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.reply("❌ **Akses Ditolak!** ❌\n\nLu gak punya izin buat pake bot ini, bro!")
-        return
-    
-    buttons = []
-    if is_admin_utama(event.sender_id):
-        buttons.extend([
-            [Button.inline("👑 Menu Admin Utama", "main_admin_menu")],
-            [Button.inline("📱 Login Nomor Baru", "login_nomor")],
-            [Button.inline("📋 List Semua Akun", "list_akun")],
-            [Button.inline("➕ Tambah Kontak", "tambah_kontak")],
-            [Button.inline("🗑️ Hapus Nomor", "hapus_nomor")],
-            [Button.inline("🧹 Clear Kontak", "clear_kontak")],
-            [Button.inline("👥 Invite ke Grup/Channel", "invite_grup")]
-        ])
-    else:
-        buttons.extend([
-            [Button.inline("📱 Login Nomor Baru", "login_nomor")],
-            [Button.inline("📋 List Semua Akun", "list_akun")],
-            [Button.inline("➕ Tambah Kontak", "tambah_kontak")],
-            [Button.inline("🗑️ Hapus Nomor", "hapus_nomor")],
-            [Button.inline("🧹 Clear Kontak", "clear_kontak")],
-            [Button.inline("👥 Invite ke Grup/Channel", "invite_grup")]
-        ])
-    
-    msg = format_message("SELAMAT DATANG BRO! 🔥", 
-                        "Pilih menu yang lu mau dibawah ini:")
-    
-    await event.reply(msg, buttons=buttons)
-
-# Admin Utama Menu
-@bot.on(events.CallbackQuery(data=b'main_admin_menu'))
-async def main_admin_menu(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Lu bukan admin utama!", alert=True)
-        return
-    
-    buttons = [
-        [Button.inline("👨‍💼 Kelola Admin Bot", "kelola_admin")],
-        [Button.inline("📝 Edit Kategori", "edit_kategori")],
-        [Button.inline("🔄 Pindah Nomor Kategori", "pindah_kategori")],
-        [Button.inline("🔙 Kembali", "back_to_main")]
-    ]
-    
-    msg = format_message("MENU ADMIN UTAMA 👑", 
-                        "Fitur khusus buat admin utama:")
-    
-    await event.edit(msg, buttons=buttons)
-
-# Kelola Admin Bot
-@bot.on(events.CallbackQuery(data=b'kelola_admin'))
-async def kelola_admin_menu(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    buttons = [
-        [Button.inline("➕ Tambah Admin", "tambah_admin")],
-        [Button.inline("➖ Hapus Admin", "hapus_admin")],
-        [Button.inline("📋 List Admin", "list_admin")],
-        [Button.inline("🔙 Kembali", "main_admin_menu")]
-    ]
-    
-    msg = format_message("KELOLA ADMIN BOT 👨‍💼")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(data=b'tambah_admin'))
-async def tambah_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    user_states[event.sender_id] = {"action": "tambah_admin"}
-    msg = format_message("TAMBAH ADMIN BARU", 
-                        "Forward pesan dari user yang mau dijadikan admin atau kirim user ID:")
-    await event.edit(msg)
-
-@bot.on(events.CallbackQuery(data=b'list_admin'))
-async def list_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    admins = get_all_admin_bots()
-    
-    if not admins:
-        content = "Belum ada admin bot yang ditambahkan."
-    else:
-        content = "**LIST ADMIN BOT:**\n\n"
-        for admin_id, added_at in admins:
-            try:
-                user = await bot.get_entity(admin_id)
-                name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-                username = f"@{user.username}" if user.username else "No username"
-            except:
-                name = "Unknown User"
-                username = ""
+    def create_backup(self) -> Optional[str]:
+        """Buat backup semua file"""
+        try:
+            backup_dir = os.path.join(self.data_dir, "backups")
+            if not os.path.exists(backup_dir):
+                os.makedirs(backup_dir)
             
-            content += f"👤 **{name}** {username}\n"
-            content += f"🆔 ID: `{admin_id}`\n"
-            content += f"📅 Ditambahkan: {added_at}\n\n"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_subdir = os.path.join(backup_dir, f"backup_{timestamp}")
+            os.makedirs(backup_subdir)
+            
+            for file_type, file_path in self.files.items():
+                if os.path.exists(file_path):
+                    filename = os.path.basename(file_path)
+                    backup_path = os.path.join(backup_subdir, filename)
+                    shutil.copy2(file_path, backup_path)
+            
+            self.logger.info(f"Backup created: {backup_subdir}")
+            return backup_subdir
+            
+        except Exception as e:
+            self.logger.error(f"Backup error: {e}")
+            return None
     
-    buttons = [[Button.inline("🔙 Kembali", "kelola_admin")]]
-    msg = format_message("DAFTAR ADMIN BOT", content)
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(data=b'hapus_admin'))
-async def hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    admins = get_all_admin_bots()
-    
-    if not admins:
-        buttons = [[Button.inline("🔙 Kembali", "kelola_admin")]]
-        msg = format_message("TIDAK ADA ADMIN BOT", 
-                            "Belum ada admin bot yang bisa dihapus.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for admin_id, _ in admins:
+    def cleanup_old_backups(self, keep_days: int = 7):
+        """Hapus backup lama"""
         try:
-            user = await bot.get_entity(admin_id)
-            name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-            username = f"@{user.username}" if user.username else ""
-            display_name = f"{name} {username}".strip()
-        except:
-            display_name = f"User ID: {admin_id}"
+            backup_dir = os.path.join(self.data_dir, "backups")
+            if not os.path.exists(backup_dir):
+                return
+            
+            current_time = time.time()
+            cutoff_time = current_time - (keep_days * 24 * 60 * 60)
+            
+            removed_count = 0
+            for backup_folder in os.listdir(backup_dir):
+                backup_path = os.path.join(backup_dir, backup_folder)
+                if os.path.isdir(backup_path):
+                    folder_time = os.path.getctime(backup_path)
+                    if folder_time < cutoff_time:
+                        shutil.rmtree(backup_path)
+                        removed_count += 1
+            
+            if removed_count > 0:
+                self.logger.info(f"Cleaned up {removed_count} old backups")
+                
+        except Exception as e:
+            self.logger.error(f"Cleanup error: {e}")
+
+# ==================== DATABASE OPERATIONS ====================
+class DatabaseManager:
+    """Manager untuk operasi database/JSON"""
+    
+    def __init__(self, storage: StorageManager):
+        self.storage = storage
+        self.logger = logging.getLogger(self.__class__.__name__)
+    
+    # Kategori operations
+    def get_all_kategori(self) -> List[Kategori]:
+        """Get semua kategori"""
+        data = self.storage.read_json('kategori')
+        return [Kategori(**item) for item in data]
+    
+    def add_kategori(self, nama: str) -> bool:
+        """Tambah kategori baru"""
+        data = self.storage.read_json('kategori')
         
-        buttons.append([Button.inline(f"🗑️ {display_name}", f"confirm_hapus_admin_{admin_id}")])
+        # Check duplicate (case insensitive)
+        if any(item['nama'].lower() == nama.lower() for item in data):
+            return False
+        
+        new_kategori = {
+            'id': self.storage.get_next_id('kategori'),
+            'nama': nama.strip(),
+            'created_at': datetime.now().isoformat()
+        }
+        
+        data.append(new_kategori)
+        return self.storage.write_json('kategori', data)
     
-    buttons.append([Button.inline("🔙 Kembali", "kelola_admin")])
+    def update_kategori(self, kategori_id: int, nama_baru: str) -> bool:
+        """Update nama kategori"""
+        data = self.storage.read_json('kategori')
+        
+        # Check duplicate (exclude current)
+        nama_baru = nama_baru.strip()
+        if any(item['nama'].lower() == nama_baru.lower() and item['id'] != kategori_id 
+               for item in data):
+            return False
+        
+        for item in data:
+            if item['id'] == kategori_id:
+                item['nama'] = nama_baru
+                return self.storage.write_json('kategori', data)
+        
+        return False
     
-    msg = format_message("HAPUS ADMIN BOT 🗑️", 
-                        "Pilih admin yang mau dihapus:")
-    await event.edit(msg, buttons=buttons)
+    def get_kategori_by_id(self, kategori_id: int) -> Optional[Kategori]:
+        """Get kategori by ID"""
+        data = self.storage.read_json('kategori')
+        item = next((item for item in data if item['id'] == kategori_id), None)
+        return Kategori(**item) if item else None
+    
+    # Akun TG operations
+    def get_akun_by_kategori(self, kategori_id: int) -> List[AkunTG]:
+        """Get akun berdasarkan kategori"""
+        data = self.storage.read_json('akun_tg')
+        filtered_data = [item for item in data if item['kategori_id'] == kategori_id]
+        return [AkunTG(**item) for item in filtered_data]
+    
+    def add_akun_tg(self, nomor: str, session_string: str, kategori_id: int, nama_akun: str = '') -> bool:
+        """Tambah akun TG baru"""
+        data = self.storage.read_json('akun_tg')
+        
+        # Check duplicate
+        if any(item['nomor'] == nomor for item in data):
+            return False
+        
+        new_akun = {
+            'id': self.storage.get_next_id('akun_tg'),
+            'nomor': nomor,
+            'session_string': session_string,
+            'kategori_id': kategori_id,
+            'nama_akun': nama_akun,
+            'created_at': datetime.now().isoformat(),
+            'is_active': True
+        }
+        
+        data.append(new_akun)
+        return self.storage.write_json('akun_tg', data)
+    
+    def get_akun_by_id(self, akun_id: int) -> Optional[AkunTG]:
+        """Get akun by ID"""
+        data = self.storage.read_json('akun_tg')
+        item = next((item for item in data if item['id'] == akun_id), None)
+        return AkunTG(**item) if item else None
+    
+    def delete_akun_by_id(self, akun_id: int) -> bool:
+        """Hapus akun by ID"""
+        data = self.storage.read_json('akun_tg')
+        original_length = len(data)
+        data = [item for item in data if item['id'] != akun_id]
+        
+        if len(data) < original_length:
+            return self.storage.write_json('akun_tg', data)
+        return False
+    
+    def update_akun_kategori(self, akun_id: int, new_kategori_id: int) -> bool:
+        """Update kategori akun"""
+        data = self.storage.read_json('akun_tg')
+        
+        for item in data:
+            if item['id'] == akun_id:
+                item['kategori_id'] = new_kategori_id
+                return self.storage.write_json('akun_tg', data)
+        
+        return False
+    
+    # Admin Bot operations
+    def is_admin_utama(self, user_id: int) -> bool:
+        return user_id == config.ADMIN_UTAMA
+    
+    def is_admin_bot(self, user_id: int) -> bool:
+        data = self.storage.read_json('admin_bots')
+        return any(item['user_id'] == user_id for item in data)
+    
+    def is_authorized(self, user_id: int) -> bool:
+        return self.is_admin_utama(user_id) or self.is_admin_bot(user_id)
+    
+    def add_admin_bot(self, user_id: int, added_by: int) -> bool:
+        """Tambah admin bot"""
+        data = self.storage.read_json('admin_bots')
+        
+        # Check duplicate
+        if any(item['user_id'] == user_id for item in data):
+            return False
+        
+        new_admin = {
+            'user_id': user_id,
+            'added_by': added_by,
+            'added_at': datetime.now().isoformat()
+        }
+        
+        data.append(new_admin)
+        return self.storage.write_json('admin_bots', data)
+    
+    def get_all_admin_bots(self) -> List[AdminBot]:
+        """Get semua admin bots"""
+        data = self.storage.read_json('admin_bots')
+        return [AdminBot(**item) for item in data]
+    
+    def delete_admin_bot(self, user_id: int) -> bool:
+        """Hapus admin bot"""
+        data = self.storage.read_json('admin_bots')
+        original_length = len(data)
+        data = [item for item in data if item['user_id'] != user_id]
+        
+        if len(data) < original_length:
+            return self.storage.write_json('admin_bots', data)
+        return False
+    
+    # Temp Contacts operations  
+    def add_temp_contact(self, user_id: int, contact_data: Dict) -> bool:
+        """Tambah temporary contact"""
+        data = self.storage.read_json('temp_contacts')
+        
+        new_contact = {
+            'user_id': user_id,
+            'contact_data': contact_data,
+            'created_at': datetime.now().isoformat()
+        }
+        
+        data.append(new_contact)
+        return self.storage.write_json('temp_contacts', data)
+    
+    def get_temp_contacts(self, user_id: int) -> List[Dict]:
+        """Get temporary contacts by user ID"""
+        data = self.storage.read_json('temp_contacts')
+        return [item['contact_data'] for item in data if item['user_id'] == user_id]
+    
+    def clear_temp_contacts(self, user_id: int) -> bool:
+        """Clear temporary contacts by user ID"""
+        data = self.storage.read_json('temp_contacts')
+        original_length = len(data)
+        data = [item for item in data if item['user_id'] != user_id]
+        
+        if len(data) < original_length:
+            return self.storage.write_json('temp_contacts', data)
+        return True
 
-@bot.on(events.CallbackQuery(pattern=r'confirm_hapus_admin_(\d+)'))
-async def confirm_hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
+# ==================== UTILITIES ====================
+class MessageFormatter:
+    """Utility untuk format pesan"""
     
-    admin_id = int(event.data.decode().split('_')[-1])
-    
-    try:
-        user = await bot.get_entity(admin_id)
-        name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-        display_name = name
-    except:
-        display_name = f"User ID: {admin_id}"
-    
-    buttons = [
-        [Button.inline("✅ Ya, Hapus!", f"execute_hapus_admin_{admin_id}")],
-        [Button.inline("❌ Batal", "hapus_admin")]
-    ]
-    
-    msg = format_message("KONFIRMASI HAPUS ADMIN ⚠️", 
-                       f"Lu yakin mau hapus **{display_name}** dari admin bot?")
-    
-    await event.edit(msg, buttons=buttons)
+    @staticmethod
+    def format_message(title: str, content: str = "", success: bool = None) -> str:
+        """Format pesan dengan style yang konsisten"""
+        
+        if success is True:
+            icon = "✅"
+        elif success is False:
+            icon = "❌"
+        else:
+            icon = "🤖"
+        
+        msg = "━━━━━━━━━━━━━━━━━━\n"
+        msg += f"{icon} **{title}** {icon}\n"
+        msg += "━━━━━━━━━━━━━━━━━━\n"
+        
+        if content:
+            msg += f"{content}\n"
+            
+        return msg
 
-@bot.on(events.CallbackQuery(pattern=r'execute_hapus_admin_(\d+)'))
-async def execute_hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
+class SessionManager:
+    """Manager untuk Telethon sessions"""
     
-    admin_id = int(event.data.decode().split('_')[-1])
-    
-    if delete_admin_bot(admin_id):
+    @staticmethod
+    @asynccontextmanager
+    async def get_client(session_string: str):
+        """Context manager untuk Telethon client"""
+        client = TelegramClient(StringSession(session_string), config.API_ID, config.API_HASH)
         try:
-            user = await bot.get_entity(admin_id)
-            name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-            display_name = name
-        except:
-            display_name = f"User ID: {admin_id}"
+            await client.connect()
+            yield client
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+
+# ==================== STATE MANAGER ====================
+class StateManager:
+    """Manager untuk user states"""
+    
+    def __init__(self):
+        self._states: Dict[int, Dict] = {}
+        self._lock = threading.RLock()
+    
+    def set_state(self, user_id: int, state: Dict):
+        with self._lock:
+            self._states[user_id] = state
+    
+    def get_state(self, user_id: int) -> Optional[Dict]:
+        with self._lock:
+            return self._states.get(user_id)
+    
+    def clear_state(self, user_id: int):
+        with self._lock:
+            self._states.pop(user_id, None)
+    
+    def has_state(self, user_id: int) -> bool:
+        with self._lock:
+            return user_id in self._states
+
+# ==================== BOT CLASS ====================
+class TelegramBotManager:
+    """Main bot class"""
+    
+    def __init__(self):
+        self.logger = setup_logging()
+        self.storage = StorageManager(config.DATA_DIR)
+        self.db = DatabaseManager(self.storage)
+        self.state_manager = StateManager()
+        self.formatter = MessageFormatter()
         
-        buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
-        msg = format_message("ADMIN BERHASIL DIHAPUS! ✅", 
-                           f"**{display_name}** udah dihapus dari admin bot!")
+        # Initialize bot client
+        self.bot = TelegramClient('bot_session', config.API_ID, config.API_HASH)
+        
+        # Setup event handlers
+        self._setup_handlers()
+    
+    def _setup_handlers(self):
+        """Setup semua event handlers"""
+        
+        @self.bot.on(events.NewMessage(pattern='/start'))
+        async def start_handler(event):
+            await self.handle_start(event)
+        
+        @self.bot.on(events.NewMessage(pattern='/done'))
+        async def done_handler(event):
+            await self.handle_done(event)
+        
+        @self.bot.on(events.CallbackQuery)
+        async def callback_handler(event):
+            await self.handle_callback(event)
+        
+        @self.bot.on(events.NewMessage)
+        async def message_handler(event):
+            await self.handle_message(event)
+    
+    async def handle_start(self, event):
+        """Handle /start command"""
+        user_id = event.sender_id
+        
+        if not self.db.is_authorized(user_id):
+            await event.reply(self.formatter.format_message(
+                "AKSES DITOLAK", 
+                "Anda tidak memiliki izin untuk menggunakan bot ini.",
+                success=False
+            ))
+            return
+        
+        # Clear any existing state
+        self.state_manager.clear_state(user_id)
+        
+        # Build menu buttons
+        buttons = self._build_main_menu(user_id)
+        
+        msg = self.formatter.format_message(
+            "SELAMAT DATANG", 
+            "Pilih menu yang ingin Anda gunakan:"
+        )
+        
+        await event.reply(msg, buttons=buttons)
+    
+    def _build_main_menu(self, user_id: int) -> List[List[Button]]:
+        """Build main menu buttons based on user permissions"""
+        buttons = []
+        
+        if self.db.is_admin_utama(user_id):
+            buttons.append([Button.inline("👑 Menu Admin Utama", b"main_admin_menu")])
+        
+        buttons.extend([
+            [Button.inline("📱 Login Nomor Baru", b"login_nomor")],
+            [Button.inline("📋 List Semua Akun", b"list_akun")],
+            [Button.inline("➕ Tambah Kontak", b"tambah_kontak")],
+            [Button.inline("🗑️ Hapus Nomor", b"hapus_nomor")],
+            [Button.inline("🧹 Clear Kontak", b"clear_kontak")],
+            [Button.inline("👥 Invite ke Grup/Channel", b"invite_grup")]
+        ])
+        
+        return buttons
+    
+    async def handle_callback(self, event):
+        """Handle callback queries dari inline buttons"""
+        try:
+            user_id = event.sender_id
+            data = event.data
+            
+            if not self.db.is_authorized(user_id):
+                await event.answer("❌ Akses ditolak!", alert=True)
+                return
+            
+            # Route callbacks
+            if data == b"back_to_main":
+                await self._show_main_menu(event)
+            elif data == b"main_admin_menu":
+                await self._show_admin_menu(event)
+            elif data == b"login_nomor":
+                await self._start_login_process(event)
+            elif data == b"list_akun":
+                await self._show_kategori_list_akun(event)
+            elif data == b"tambah_kontak":
+                await self._start_tambah_kontak(event)
+            elif data.startswith(b"pilih_kategori_"):
+                await self._handle_kategori_selection(event)
+            # Add more callback handlers as needed...
+            
+        except Exception as e:
+            self.logger.error(f"Error in callback handler: {e}")
+            await event.answer("❌ Terjadi kesalahan internal!", alert=True)
+    
+    async def handle_message(self, event):
+        """Handle text messages based on user state"""
+        try:
+            user_id = event.sender_id
+            
+            if not self.db.is_authorized(user_id):
+                return
+            
+            # Skip if it's a command or not text
+            if event.message.text and event.message.text.startswith('/'):
+                return
+            
+            state = self.state_manager.get_state(user_id)
+            if not state:
+                return
+            
+            action = state.get("action")
+            
+            if action == "login_step1":
+                await self._process_login_phone(event)
+            elif action == "login_step2":
+                await self._process_login_code(event)
+            elif action == "login_step2_password":
+                await self._process_login_password(event)
+            elif action == "tambah_kontak_step1":
+                await self._process_contact_input(event)
+            elif action == "buat_kategori":
+                await self._process_new_kategori(event)
+            # Add more state handlers...
+            
+        except Exception as e:
+            self.logger.error(f"Error in message handler: {e}")
+            await event.reply("❌ Terjadi kesalahan saat memproses pesan!")
+    
+    async def handle_done(self, event):
+        """Handle /done command"""
+        user_id = event.sender_id
+        
+        if not self.db.is_authorized(user_id):
+            return
+        
+        state = self.state_manager.get_state(user_id)
+        if not state:
+            return
+        
+        if state.get("action") == "tambah_kontak_step1":
+            await self._finish_contact_input(event)
+    
+    # ==================== MENU HANDLERS ====================
+    async def _show_main_menu(self, event):
+        """Show main menu"""
+        user_id = event.sender_id
+        self.state_manager.clear_state(user_id)
+        
+        buttons = self._build_main_menu(user_id)
+        msg = self.formatter.format_message("MENU UTAMA", "Pilih menu yang ingin Anda gunakan:")
         
         await event.edit(msg, buttons=buttons)
-    else:
-        await event.answer("❌ Gagal menghapus admin!", alert=True)
-
-# Login Nomor Handler
-@bot.on(events.CallbackQuery(data=b'login_nomor'))
-async def login_nomor_handler(event):
-    if not is_authorized(event.sender_id):
-        return
     
-    user_states[event.sender_id] = {"action": "login_step1"}
-    msg = format_message("LOGIN NOMOR BARU 📱", 
-                        "Kirim nomor HP yang mau di-login (format: +628123456789):")
-    await event.edit(msg)
-
-# List Akun Handler  
-@bot.on(events.CallbackQuery(data=b'list_akun'))
-async def list_akun_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", "back_to_main")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat. Buat kategori dulu ya!")
+    async def _show_admin_menu(self, event):
+        """Show admin menu (admin utama only)"""
+        if not self.db.is_admin_utama(event.sender_id):
+            await event.answer("❌ Akses ditolak!", alert=True)
+            return
+        
+        buttons = [
+            [Button.inline("👨‍💼 Kelola Admin Bot", b"kelola_admin")],
+            [Button.inline("📝 Edit Kategori", b"edit_kategori")],
+            [Button.inline("🔄 Pindah Nomor Kategori", b"pindah_kategori")],
+            [Button.inline("🔙 Kembali", b"back_to_main")]
+        ]
+        
+        msg = self.formatter.format_message("MENU ADMIN UTAMA", "Fitur khusus untuk admin utama:")
         await event.edit(msg, buttons=buttons)
-        return
     
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"list_akun_kat_{kat_id}")])
+    # ==================== LOGIN HANDLERS ====================
+    async def _start_login_process(self, event):
+        """Start login process"""
+        user_id = event.sender_id
+        self.state_manager.set_state(user_id, {"action": "login_step1"})
+        
+        msg = self.formatter.format_message(
+            "LOGIN NOMOR BARU", 
+            "Kirim nomor HP yang ingin di-login (format: +628123456789):"
+        )
+        await event.edit(msg)
     
-    buttons.append([Button.inline("🔙 Kembali", "back_to_main")])
-    
-    msg = format_message("PILIH KATEGORI 📁", 
-                        "Pilih kategori buat liat akun-akun di dalamnya:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'list_akun_kat_(\d+)'))
-async def list_akun_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    
-    # Get kategori name
-    kategori = get_kategori_by_id(kategori_id)
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        content = f"Belum ada akun di kategori **{kategori_nama}**"
-    else:
-        content = f"**AKUN DI KATEGORI: {kategori_nama}**\n\n"
-        for akun_id, nomor, nama_akun in akun_list:
-            status_emoji = "🟢"  # Default online
-            content += f"{status_emoji} **{nomor}**\n"
-            if nama_akun:
-                content += f"👤 Nama: {nama_akun}\n"
-            content += f"🆔 ID: {akun_id}\n\n"
-    
-    buttons = [[Button.inline("🔙 Kembali", "list_akun")]]
-    msg = format_message(f"KATEGORI: {kategori_nama.upper()}", content)
-    await event.edit(msg, buttons=buttons)
-
-# Tambah Kontak Handler
-@bot.on(events.CallbackQuery(data=b'tambah_kontak'))
-async def tambah_kontak_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    user_states[event.sender_id] = {"action": "tambah_kontak_step1", "contacts": []}
-    msg = format_message("TAMBAH KONTAK 📞", 
-                        "Kirim kontak yang mau ditambahin satu per satu.\n\n" +
-                        "Setelah selesai kirim semua kontak, ketik `/done` buat lanjut ke step berikutnya.")
-    await event.edit(msg)
-
-# Message Handler untuk berbagai state
-@bot.on(events.NewMessage(func=lambda e: not e.message.text.startswith('/') if e.message.text else True))
-async def message_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    user_id = event.sender_id
-    
-    if user_id not in user_states:
-        return
-    
-    state = user_states[user_id]
-    
-    # Handle Login Steps
-    if state["action"] == "login_step1":
+    async def _process_login_phone(self, event):
+        """Process phone number input"""
+        user_id = event.sender_id
         nomor = event.message.text.strip()
+        
         if not nomor.startswith('+'):
             await event.reply("❌ Format nomor salah! Harus dimulai dengan + (contoh: +628123456789)")
             return
         
         try:
-            # Create new client for this number
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            # Create temporary client
+            client = TelegramClient(StringSession(), config.API_ID, config.API_HASH)
             await client.connect()
             
             result = await client.send_code_request(nomor)
             
-            user_states[user_id] = {
-                "action": "login_step2", 
+            self.state_manager.set_state(user_id, {
+                "action": "login_step2",
                 "nomor": nomor,
                 "client": client,
                 "phone_code_hash": result.phone_code_hash
-            }
+            })
             
-            await event.reply(format_message(
-                "KODE OTP DIKIRIM 📩", 
-                f"Kode OTP udah dikirim ke **{nomor}**\n\nKirim kode OTP yang lu terima:"
-            ))
+            msg = self.formatter.format_message(
+                "KODE OTP DIKIRIM", 
+                f"Kode OTP telah dikirim ke **{nomor}**\n\nKirim kode OTP yang Anda terima:"
+            )
+            await event.reply(msg)
+            
+        except PhoneNumberInvalidError:
+            await event.reply("❌ Nomor HP tidak valid!")
+            self.state_manager.clear_state(user_id)
         except Exception as e:
-            await event.reply(f"❌ **Error:** {str(e)}")
-            del user_states[user_id]
+            await event.reply(f"❌ Error: {str(e)}")
+            self.state_manager.clear_state(user_id)
     
-    elif state["action"] == "login_step2":
+    async def _process_login_code(self, event):
+        """Process OTP code input"""
+        user_id = event.sender_id
         code = event.message.text.strip()
+        state = self.state_manager.get_state(user_id)
+        
+        if not state:
+            return
         
         try:
             client = state["client"]
@@ -611,1205 +753,528 @@ async def message_handler(event):
             
             await client.sign_in(nomor, code, phone_code_hash=state["phone_code_hash"])
             
-            # Get session string
+            # Get session string and user info
             session_string = client.session.save()
-            
-            # Get user info
             me = await client.get_me()
             nama_akun = me.first_name + (f" {me.last_name}" if me.last_name else "")
-            
             await client.disconnect()
             
-            user_states[user_id] = {
+            # Update state for kategori selection
+            self.state_manager.set_state(user_id, {
                 "action": "login_step3_pilih_kategori",
                 "nomor": nomor,
                 "session_string": session_string,
                 "nama_akun": nama_akun
-            }
+            })
             
-            # Show kategori selection
-            await show_kategori_selection(event, "Pilih kategori buat nomor ini:")
+            await self._show_kategori_selection(event, "Pilih kategori untuk nomor ini:")
             
         except SessionPasswordNeededError:
-            user_states[user_id]["action"] = "login_step2_password"
-            await event.reply(format_message("BUTUH PASSWORD 🔐", 
-                                           "Akun ini pake 2FA. Kirim password 2FA lu:"))
+            # Need 2FA password
+            state["action"] = "login_step2_password"
+            self.state_manager.set_state(user_id, state)
+            
+            msg = self.formatter.format_message(
+                "BUTUH PASSWORD 2FA", 
+                "Akun ini menggunakan 2FA. Kirim password 2FA Anda:"
+            )
+            await event.reply(msg)
+            
         except PhoneCodeInvalidError:
-            await event.reply("❌ **Kode OTP salah!** Coba lagi dengan kode yang benar:")
+            await event.reply("❌ Kode OTP salah! Coba lagi dengan kode yang benar:")
         except Exception as e:
-            await event.reply(f"❌ **Error:** {str(e)}")
-            del user_states[user_id]
+            await event.reply(f"❌ Error: {str(e)}")
+            self.state_manager.clear_state(user_id)
     
-    elif state["action"] == "login_step2_password":
+    async def _process_login_password(self, event):
+        """Process 2FA password input"""
+        user_id = event.sender_id
         password = event.message.text.strip()
+        state = self.state_manager.get_state(user_id)
+        
+        if not state:
+            return
         
         try:
             client = state["client"]
             await client.sign_in(password=password)
             
-            # Get session string
+            # Get session string and user info
             session_string = client.session.save()
-            
-            # Get user info
             me = await client.get_me()
             nama_akun = me.first_name + (f" {me.last_name}" if me.last_name else "")
             
             await client.disconnect()
             
-            user_states[user_id] = {
+            # Update state for kategori selection
+            self.state_manager.set_state(user_id, {
                 "action": "login_step3_pilih_kategori",
                 "nomor": state["nomor"],
                 "session_string": session_string,
                 "nama_akun": nama_akun
-            }
+            })
             
-            await show_kategori_selection(event, "Pilih kategori buat nomor ini:")
+            await self._show_kategori_selection(event, "Pilih kategori untuk nomor ini:")
             
         except PasswordHashInvalidError:
-            await event.reply("❌ **Password salah!** Coba lagi:")
+            await event.reply("❌ Password salah! Coba lagi:")
         except Exception as e:
-            await event.reply(f"❌ **Error:** {str(e)}")
-            del user_states[user_id]
+            await event.reply(f"❌ Error: {str(e)}")
+            self.state_manager.clear_state(user_id)
     
-    # Handle Tambah Kontak
-    elif state["action"] == "tambah_kontak_step1":
+    # ==================== KATEGORI HANDLERS ====================
+    async def _show_kategori_selection(self, event, message_text: str):
+        """Show kategori selection menu"""
+        kategori_list = self.db.get_all_kategori()
+        
+        buttons = []
+        for kategori in kategori_list:
+            buttons.append([Button.inline(f"📁 {kategori.nama}", f"pilih_kategori_{kategori.id}".encode())])
+        
+        buttons.append([Button.inline("➕ Buat Kategori Baru", b"buat_kategori_baru")])
+        
+        if not kategori_list:
+            message_text = "Belum ada kategori yang dibuat.\n\nBuat kategori baru dulu:"
+            buttons = [[Button.inline("➕ Buat Kategori Baru", b"buat_kategori_baru")]]
+        
+        msg = self.formatter.format_message("PILIH KATEGORI", message_text)
+        
+        if hasattr(event, 'edit'):
+            await event.edit(msg, buttons=buttons)
+        else:
+            await event.reply(msg, buttons=buttons)
+    
+    async def _handle_kategori_selection(self, event):
+        """Handle kategori selection"""
+        user_id = event.sender_id
+        kategori_id = int(event.data.decode().split('_')[-1])
+        
+        state = self.state_manager.get_state(user_id)
+        if not state:
+            return
+        
+        kategori = self.db.get_kategori_by_id(kategori_id)
+        if not kategori:
+            await event.answer("❌ Kategori tidak ditemukan!", alert=True)
+            return
+        
+        action = state.get("action")
+        
+        if action == "login_step3_pilih_kategori":
+            # Save akun to database
+            if self.db.add_akun_tg(state["nomor"], state["session_string"], 
+                                   kategori_id, state["nama_akun"]):
+                msg = self.formatter.format_message(
+                    "LOGIN BERHASIL",
+                    f"Akun **{state['nomor']}** berhasil ditambahkan ke kategori **{kategori.nama}**!\n\n"
+                    f"👤 **Nama Akun:** {state['nama_akun']}",
+                    success=True
+                )
+                buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
+                await event.edit(msg, buttons=buttons)
+            else:
+                await event.answer("❌ Nomor ini sudah ada di database!", alert=True)
+            
+            self.state_manager.clear_state(user_id)
+        
+        elif action == "tambah_kontak_step2_pilih_kategori":
+            await self._show_akun_selection_for_contacts(event, kategori)
+    
+    async def _process_new_kategori(self, event):
+        """Process new kategori creation"""
+        user_id = event.sender_id
+        nama_kategori = event.message.text.strip()
+        
+        if not nama_kategori:
+            await event.reply("❌ Nama kategori tidak boleh kosong!")
+            return
+        
+        if self.db.add_kategori(nama_kategori):
+            msg = self.formatter.format_message(
+                "KATEGORI BERHASIL DIBUAT",
+                f"Kategori **{nama_kategori}** telah dibuat!",
+                success=True
+            )
+            await event.reply(msg)
+            
+            # Continue with previous flow if needed
+            state = self.state_manager.get_state(user_id)
+            if state:
+                if "login_step3_pilih_kategori" in str(state.get("action", "")):
+                    await self._show_kategori_selection(event, "Pilih kategori untuk nomor ini:")
+                    return
+                elif "tambah_kontak_step2_pilih_kategori" in str(state.get("action", "")):
+                    await self._show_kategori_selection(event, "Pilih kategori akun yang ingin digunakan:")
+                    return
+        else:
+            await event.reply("❌ Nama kategori sudah ada! Gunakan nama yang lain.")
+            return
+        
+        self.state_manager.clear_state(user_id)
+    
+    # ==================== LIST AKUN HANDLERS ====================
+    async def _show_kategori_list_akun(self, event):
+        """Show kategori list for viewing akun"""
+        kategori_list = self.db.get_all_kategori()
+        
+        if not kategori_list:
+            buttons = [[Button.inline("🔙 Kembali", b"back_to_main")]]
+            msg = self.formatter.format_message(
+                "BELUM ADA KATEGORI",
+                "Belum ada kategori yang dibuat. Buat kategori dulu!",
+                success=False
+            )
+            await event.edit(msg, buttons=buttons)
+            return
+        
+        buttons = []
+        for kategori in kategori_list:
+            buttons.append([Button.inline(f"📁 {kategori.nama}", f"list_akun_kat_{kategori.id}".encode())])
+        
+        buttons.append([Button.inline("🔙 Kembali", b"back_to_main")])
+        
+        msg = self.formatter.format_message(
+            "PILIH KATEGORI",
+            "Pilih kategori untuk melihat akun-akun di dalamnya:"
+        )
+        await event.edit(msg, buttons=buttons)
+    
+    # ==================== CONTACT HANDLERS ====================
+    async def _start_tambah_kontak(self, event):
+        """Start tambah kontak process"""
+        user_id = event.sender_id
+        self.state_manager.set_state(user_id, {
+            "action": "tambah_kontak_step1", 
+            "contacts": []
+        })
+        
+        msg = self.formatter.format_message(
+            "TAMBAH KONTAK",
+            "Kirim kontak yang ingin ditambahkan satu per satu.\n\n"
+            "Setelah selesai kirim semua kontak, ketik `/done` untuk lanjut ke step berikutnya."
+        )
+        await event.edit(msg)
+    
+    async def _process_contact_input(self, event):
+        """Process contact input"""
+        user_id = event.sender_id
+        state = self.state_manager.get_state(user_id)
+        
+        if not state:
+            return
+        
         if event.message.contact:
             contact_data = {
                 "phone": event.message.contact.phone_number,
                 "first_name": event.message.contact.first_name,
                 "last_name": event.message.contact.last_name
             }
+            
             state["contacts"].append(contact_data)
+            self.state_manager.set_state(user_id, state)
             
             count = len(state["contacts"])
-            await event.reply(
-                f"✅ **Kontak ke-{count} berhasil ditambahin!**\n\n"
-                f"👤 **Nama:** {contact_data['first_name']} {contact_data['last_name'] or ''}\n"
-                f"📞 **Nomor:** +{contact_data['phone']}\n\n"
-                "Kirim kontak lain atau ketik `/done` kalo udah selesai."
-            )
+            msg = f"✅ **Kontak ke-{count} berhasil ditambahkan!**\n\n"
+            msg += f"👤 **Nama:** {contact_data['first_name']} {contact_data['last_name'] or ''}\n"
+            msg += f"📞 **Nomor:** +{contact_data['phone']}\n\n"
+            msg += "Kirim kontak lain atau ketik `/done` jika sudah selesai."
+            
+            await event.reply(msg)
         else:
-            await event.reply("❌ **Kirim kontak yang valid!** Bukan text biasa.")
+            await event.reply("❌ Kirim kontak yang valid! Bukan text biasa.")
     
-    # Handle Tambah Admin
-    elif state["action"] == "tambah_admin":
-        if event.forward and event.forward.from_id:
-            new_admin_id = event.forward.from_id.user_id
-        else:
-            try:
-                new_admin_id = int(event.message.text.strip())
-            except ValueError:
-                await event.reply("❌ **Format salah!** Kirim user ID yang valid atau forward pesan dari user.")
-                return
+    async def _finish_contact_input(self, event):
+        """Finish contact input process"""
+        user_id = event.sender_id
+        state = self.state_manager.get_state(user_id)
         
-        # Check if already admin
-        if is_admin_utama(new_admin_id) or is_admin_bot(new_admin_id):
-            await event.reply("❌ **User ini udah jadi admin!**")
-            return
-        
-        # Add to database
-        if add_admin_bot(new_admin_id, user_id):
-            try:
-                user = await bot.get_entity(new_admin_id)
-                name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-                await event.reply(f"✅ **{name}** berhasil ditambahin sebagai admin bot!")
-            except:
-                await event.reply(f"✅ **User ID {new_admin_id}** berhasil ditambahin sebagai admin bot!")
-        else:
-            await event.reply("❌ **User ini udah jadi admin!**")
-        
-        del user_states[user_id]
-    
-    elif state["action"] == "buat_kategori":
-        nama_kategori = event.message.text.strip()
-        
-        if not nama_kategori:
-            await event.reply("❌ **Nama kategori tidak boleh kosong!**")
-            return
-        
-        if add_kategori(nama_kategori):
-            await event.reply(format_message("KATEGORI BERHASIL DIBUAT! ✅", 
-                                           f"Kategori **{nama_kategori}** udah dibuat!"))
-            
-            # Continue with previous flow if needed
-            if user_id in user_states:
-                previous_state = user_states[user_id]
-                if "login_step3_pilih_kategori" in str(previous_state):
-                    await show_kategori_selection(event, "Pilih kategori buat nomor ini:")
-                    return
-                elif "tambah_kontak_step2_pilih_kategori" in str(previous_state):
-                    await show_kategori_selection(event, "Pilih kategori akun yang mau dipake:")
-                    return
-        else:
-            await event.reply("❌ **Nama kategori udah ada!** Pake nama yang lain.")
-            return
-        
-        if user_id in user_states:
-            del user_states[user_id]
-    
-    elif state["action"] == "edit_nama_kategori":
-        nama_baru = event.message.text.strip()
-        
-        if not nama_baru:
-            await event.reply("❌ **Nama kategori tidak boleh kosong!**")
-            return
-        
-        kategori_id = state["kategori_id"]
-        old_name = state["old_name"]
-        
-        if update_kategori(kategori_id, nama_baru):
-            buttons = [[Button.inline("🔙 Kembali ke Menu Admin", b"main_admin_menu")]]
-            msg = format_message(
-                "NAMA KATEGORI BERHASIL DIUBAH! ✅", 
-                f"**Nama lama:** {old_name}\n**Nama baru:** {nama_baru}"
-            )
-            await event.reply(msg, buttons=buttons)
-        else:
-            await event.reply("❌ **Nama kategori udah ada!** Pake nama yang lain.")
-            return
-        
-        del user_states[user_id]
-    
-    elif state["action"] == "invite_input_grup":
-        grup_input = event.message.text.strip()
-        akun_id = state["akun_id"]
-        
-        try:
-            # Get akun data
-            akun = get_akun_by_id(akun_id)
-            
-            if not akun:
-                await event.reply("❌ **Akun tidak ditemukan!**")
-                del user_states[user_id]
-                return
-            
-            nomor = akun['nomor']
-            session_string = akun['session_string']
-            
-            # Connect with the account
-            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-            await client.connect()
-            
-            # Get the target entity (group/channel)
-            try:
-                target_entity = await client.get_entity(grup_input)
-            except Exception:
-                await event.reply("❌ **Grup/Channel tidak ditemukan!** Cek lagi username atau link nya.")
-                await client.disconnect()
-                return
-            
-            # Get all contacts
-            contacts = await client(GetContactsRequest(hash=0))
-            
-            if not contacts.users:
-                await client.disconnect()
-                await event.reply("❌ **Akun ini tidak punya kontak untuk di-invite!**")
-                del user_states[user_id]
-                return
-            
-            # Invite contacts to the group/channel
-            success_count = 0
-            total_count = len(contacts.users)
-            
-            msg_status = await event.reply(format_message(
-                "PROSES INVITE... ⏳", 
-                f"Mulai invite {total_count} kontak ke grup/channel..."
-            ))
-            
-            for i, user in enumerate(contacts.users):
-                try:
-                    if isinstance(target_entity, Channel):
-                        await client(InviteToChannelRequest(target_entity, [user]))
-                    else:
-                        await client(AddChatUserRequest(target_entity.id, user.id, 0))
-                    
-                    success_count += 1
-                    
-                    # Update progress every 10 invites
-                    if (i + 1) % 10 == 0:
-                        progress_msg = format_message(
-                            "PROSES INVITE... ⏳", 
-                            f"Progress: {i + 1}/{total_count}\nBerhasil: {success_count}"
-                        )
-                        await msg_status.edit(progress_msg)
-                        
-                        # Add delay to avoid flood limits
-                        await asyncio.sleep(2)
-                
-                except Exception:
-                    # Skip users that can't be added
-                    continue
-            
-            await client.disconnect()
-            
-            # Final result
-            buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-            msg = format_message(
-                "INVITE SELESAI! 🎉", 
-                f"**Akun:** {nomor}\n"
-                f"**Target:** {target_entity.title if hasattr(target_entity, 'title') else grup_input}\n"
-                f"**Berhasil di-invite:** {success_count}/{total_count} kontak\n\n"
-                "Proses invite sudah selesai!"
-            )
-            await msg_status.edit(msg, buttons=buttons)
-            
-        except Exception as e:
-            await event.reply(f"❌ **Error:** {str(e)}")
-        finally:
-            if user_id in user_states:
-                del user_states[user_id]
-
-# Done Command Handler
-@bot.on(events.NewMessage(pattern='/done'))
-async def done_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    user_id = event.sender_id
-    
-    if user_id not in user_states:
-        return
-    
-    state = user_states[user_id]
-    
-    if state["action"] == "tambah_kontak_step1":
-        if not state["contacts"]:
-            await event.reply("❌ **Belum ada kontak yang ditambahin!**")
+        if not state or not state.get("contacts"):
+            await event.reply("❌ Belum ada kontak yang ditambahkan!")
             return
         
         # Save contacts temporarily
-        clear_temp_contacts(user_id)  # Clear old temp contacts
+        self.db.clear_temp_contacts(user_id)
         
         for contact in state["contacts"]:
-            add_temp_contact(user_id, contact)
+            self.db.add_temp_contact(user_id, contact)
         
-        user_states[user_id] = {"action": "tambah_kontak_step2_pilih_kategori"}
+        self.state_manager.set_state(user_id, {"action": "tambah_kontak_step2_pilih_kategori"})
         
-        await show_kategori_selection(event, f"✅ **{len(state['contacts'])} kontak udah disimpen sementara!**\n\n" +
-                                            "Sekarang pilih kategori akun yang mau dipake buat nyimpen kontak:")
-
-# Helper function to show kategori selection
-async def show_kategori_selection(event, message_text):
-    kategori_list = get_kategori()
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"pilih_kategori_{kat_id}")])
-    
-    buttons.append([Button.inline("➕ Buat Kategori Baru", "buat_kategori_baru")])
-    
-    if not kategori_list:
-        message_text = "Belum ada kategori yang dibuat.\n\nBuat kategori baru dulu:"
-        buttons = [[Button.inline("➕ Buat Kategori Baru", "buat_kategori_baru")]]
-    
-    msg = format_message("PILIH KATEGORI 📁", message_text)
-    
-    if hasattr(event, 'edit'):
-        await event.edit(msg, buttons=buttons)
-    else:
-        await event.reply(msg, buttons=buttons)
-
-# Kategori Selection Handler
-@bot.on(events.CallbackQuery(pattern=r'pilih_kategori_(\d+)'))
-async def pilih_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    user_id = event.sender_id
-    
-    if user_id not in user_states:
-        return
-    
-    state = user_states[user_id]
-    
-    # Get kategori name
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    
-    if state["action"] == "login_step3_pilih_kategori":
-        # Save akun to database
-        if add_akun_tg(state["nomor"], state["session_string"], kategori_id, state["nama_akun"]):
-            msg = format_message("LOGIN BERHASIL! 🎉", 
-                               f"Akun **{state['nomor']}** berhasil ditambahin ke kategori **{kategori_nama}**!\n\n" +
-                               f"👤 **Nama Akun:** {state['nama_akun']}")
-            
-            buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
-            await event.edit(msg, buttons=buttons)
-        else:
-            await event.answer("❌ Nomor ini udah ada di database!", alert=True)
+        message_text = f"✅ **{len(state['contacts'])} kontak telah disimpan sementara!**\n\n"
+        message_text += "Sekarang pilih kategori akun yang ingin digunakan untuk menyimpan kontak:"
         
-        del user_states[user_id]
+        await self._show_kategori_selection(event, message_text)
     
-    elif state["action"] == "tambah_kontak_step2_pilih_kategori":
-        # Get akun in selected kategori
-        akun_list = get_akun_by_kategori(kategori_id)
+    async def _show_akun_selection_for_contacts(self, event, kategori):
+        """Show akun selection for contacts"""
+        user_id = event.sender_id
+        akun_list = self.db.get_akun_by_kategori(kategori.id)
         
         if not akun_list:
-            await event.answer(f"❌ Belum ada akun di kategori {kategori_nama}!", alert=True)
+            await event.answer(f"❌ Belum ada akun di kategori {kategori.nama}!", alert=True)
             return
         
-        # Show akun selection
         buttons = []
-        for akun_id, nomor, nama_akun in akun_list:
-            display_name = f"{nomor}"
-            if nama_akun:
-                display_name += f" ({nama_akun})"
-            buttons.append([Button.inline(f"📱 {display_name}", f"pilih_akun_kontak_{akun_id}")])
+        for akun in akun_list:
+            display_name = f"{akun.nomor}"
+            if akun.nama_akun:
+                display_name += f" ({akun.nama_akun})"
+            buttons.append([Button.inline(f"📱 {display_name}", f"pilih_akun_kontak_{akun.id}".encode())])
         
-        buttons.append([Button.inline("🔙 Kembali", "tambah_kontak")])
+        buttons.append([Button.inline("🔙 Kembali", b"tambah_kontak")])
         
-        user_states[user_id]["selected_kategori"] = kategori_id
+        self.state_manager.set_state(user_id, {
+            "action": "tambah_kontak_step2_pilih_kategori",
+            "selected_kategori": kategori.id
+        })
         
-        msg = format_message(f"PILIH AKUN - {kategori_nama.upper()}", 
-                           "Pilih akun yang mau dipake buat nyimpen kontak:")
+        msg = self.formatter.format_message(
+            f"PILIH AKUN - {kategori.nama.upper()}",
+            "Pilih akun yang ingin digunakan untuk menyimpan kontak:"
+        )
         await event.edit(msg, buttons=buttons)
-
-# Akun Selection for Tambah Kontak
-@bot.on(events.CallbackQuery(pattern=r'pilih_akun_kontak_(\d+)'))
-async def pilih_akun_kontak_handler(event):
-    if not is_authorized(event.sender_id):
-        return
     
-    akun_id = int(event.data.decode().split('_')[-1])
-    user_id = event.sender_id
-    
-    # Get akun data
-    akun = get_akun_by_id(akun_id)
-    
-    # Get temp contacts
-    temp_contacts = get_temp_contacts(user_id)
-    
-    if not akun or not temp_contacts:
-        await event.answer("❌ Data tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    session_string = akun['session_string']
-    
-    try:
-        # Connect with the selected account
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.connect()
+    # ==================== INVITE HANDLERS ====================
+    async def _start_invite_process(self, event):
+        """Start invite process"""
+        kategori_list = self.db.get_all_kategori()
         
-        # Prepare contacts for import
-        contacts_to_import = []
-        for i, contact_data in enumerate(temp_contacts):
-            contact = InputPhoneContact(
-                client_id=i,
-                phone='+' + contact_data['phone'].replace('+', ''),
-                first_name=contact_data['first_name'],
-                last_name=contact_data['last_name'] or ''
+        if not kategori_list:
+            buttons = [[Button.inline("🔙 Kembali", b"back_to_main")]]
+            msg = self.formatter.format_message(
+                "BELUM ADA KATEGORI",
+                "Belum ada kategori yang dibuat.",
+                success=False
             )
-            contacts_to_import.append(contact)
-        
-        # Import contacts
-        result = await client(ImportContactsRequest(contacts_to_import))
-        
-        await client.disconnect()
-        
-        # Clear temp contacts
-        clear_temp_contacts(user_id)
-        
-        success_count = len(result.imported)
-        total_count = len(contacts_to_import)
-        
-        msg = format_message("KONTAK BERHASIL DITAMBAHIN! ✅", 
-                           f"**Akun:** {nomor}\n" +
-                           f"**Berhasil:** {success_count}/{total_count} kontak\n\n" +
-                           "Semua kontak udah disimpen ke akun Telegram yang dipilih!")
-        
-        buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
-        await event.edit(msg, buttons=buttons)
-        
-        if user_id in user_states:
-            del user_states[user_id]
-            
-    except Exception as e:
-        await event.answer(f"❌ Error: {str(e)}", alert=True)
-
-# Buat Kategori Baru Handler
-@bot.on(events.CallbackQuery(data=b'buat_kategori_baru'))
-async def buat_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    user_states[event.sender_id] = {"action": "buat_kategori"}
-    msg = format_message("BUAT KATEGORI BARU 📁", 
-                        "Kirim nama kategori yang mau lu buat:")
-    await event.edit(msg)
-
-# Back to Main Handler
-@bot.on(events.CallbackQuery(data=b'back_to_main'))
-async def back_to_main_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    # Clear user state
-    if event.sender_id in user_states:
-        del user_states[event.sender_id]
-    
-    buttons = []
-    if is_admin_utama(event.sender_id):
-        buttons.extend([
-            [Button.inline("👑 Menu Admin Utama", "main_admin_menu")],
-            [Button.inline("📱 Login Nomor Baru", "login_nomor")],
-            [Button.inline("📋 List Semua Akun", "list_akun")],
-            [Button.inline("➕ Tambah Kontak", "tambah_kontak")],
-            [Button.inline("🗑️ Hapus Nomor", "hapus_nomor")],
-            [Button.inline("🧹 Clear Kontak", "clear_kontak")],
-            [Button.inline("👥 Invite ke Grup/Channel", "invite_grup")]
-        ])
-    else:
-        buttons.extend([
-            [Button.inline("📱 Login Nomor Baru", "login_nomor")],
-            [Button.inline("📋 List Semua Akun", "list_akun")],
-            [Button.inline("➕ Tambah Kontak", "tambah_kontak")],
-            [Button.inline("🗑️ Hapus Nomor", "hapus_nomor")],
-            [Button.inline("🧹 Clear Kontak", "clear_kontak")],
-            [Button.inline("👥 Invite ke Grup/Channel", "invite_grup")]
-        ])
-    
-    msg = format_message("MENU UTAMA 🏠", 
-                        "Pilih menu yang lu mau:")
-    
-    await event.edit(msg, buttons=buttons)
-
-# Hapus Nomor Handler
-@bot.on(events.CallbackQuery(data=b'hapus_nomor'))
-async def hapus_nomor_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", "back_to_main")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"hapus_nomor_kat_{kat_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "back_to_main")])
-    
-    msg = format_message("HAPUS NOMOR 🗑️", 
-                        "Pilih kategori buat liat nomor yang bisa dihapus:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'hapus_nomor_kat_(\d+)'))
-async def hapus_nomor_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    
-    # Get kategori name
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        buttons = [[Button.inline("🔙 Kembali", "hapus_nomor")]]
-        msg = format_message(f"KATEGORI: {kategori_nama.upper()}", 
-                           "Belum ada akun di kategori ini.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for akun_id, nomor, nama_akun in akun_list:
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        buttons.append([Button.inline(f"🗑️ {display_name}", f"confirm_hapus_{akun_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "hapus_nomor")])
-    
-    msg = format_message(f"HAPUS NOMOR - {kategori_nama.upper()}", 
-                       "Pilih nomor yang mau dihapus:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'confirm_hapus_(\d+)'))
-async def confirm_hapus_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    
-    # Get akun info
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    nama_akun = akun.get('nama_akun', '')
-    display_name = f"{nomor}"
-    if nama_akun:
-        display_name += f" ({nama_akun})"
-    
-    buttons = [
-        [Button.inline("✅ Ya, Hapus!", f"execute_hapus_{akun_id}")],
-        [Button.inline("❌ Batal", "hapus_nomor")]
-    ]
-    
-    msg = format_message("KONFIRMASI HAPUS ⚠️", 
-                       f"Lu yakin mau hapus akun **{display_name}**?\n\n" +
-                       "**PERINGATAN:** Data session akan dihapus permanen!")
-    
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'execute_hapus_(\d+)'))
-async def execute_hapus_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    
-    # Get akun info before deletion
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    
-    if delete_akun_by_id(akun_id):
-        buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
-        msg = format_message("BERHASIL DIHAPUS! ✅", 
-                           f"Akun **{nomor}** berhasil dihapus dari database!")
-        
-        await event.edit(msg, buttons=buttons)
-    else:
-        await event.answer("❌ Gagal menghapus akun!", alert=True)
-
-# Clear Kontak Handler
-@bot.on(events.CallbackQuery(data=b'clear_kontak'))
-async def clear_kontak_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", "back_to_main")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"clear_kontak_kat_{kat_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "back_to_main")])
-    
-    msg = format_message("CLEAR KONTAK 🧹", 
-                        "Pilih kategori buat clear kontak dari akun:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'clear_kontak_kat_(\d+)'))
-async def clear_kontak_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    
-    # Get kategori name and akun list
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        buttons = [[Button.inline("🔙 Kembali", "clear_kontak")]]
-        msg = format_message(f"KATEGORI: {kategori_nama.upper()}", 
-                           "Belum ada akun di kategori ini.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for akun_id, nomor, nama_akun in akun_list:
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        buttons.append([Button.inline(f"🧹 {display_name}", f"confirm_clear_{akun_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "clear_kontak")])
-    
-    msg = format_message(f"CLEAR KONTAK - {kategori_nama.upper()}", 
-                       "Pilih akun yang mau di-clear kontaknya:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'confirm_clear_(\d+)'))
-async def confirm_clear_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    
-    # Get akun info
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    nama_akun = akun.get('nama_akun', '')
-    display_name = f"{nomor}"
-    if nama_akun:
-        display_name += f" ({nama_akun})"
-    
-    buttons = [
-        [Button.inline("✅ Ya, Clear Semua!", f"execute_clear_{akun_id}")],
-        [Button.inline("❌ Batal", "clear_kontak")]
-    ]
-    
-    msg = format_message("KONFIRMASI CLEAR KONTAK ⚠️", 
-                       f"Lu yakin mau clear SEMUA kontak dari **{display_name}**?\n\n" +
-                       "**PERINGATAN:** Semua kontak akan dihapus permanen!")
-    
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'execute_clear_(\d+)'))
-async def execute_clear_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    
-    # Get akun data
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    session_string = akun['session_string']
-    
-    try:
-        # Connect with the account
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.connect()
-        
-        # Get all contacts
-        contacts = await client(GetContactsRequest(hash=0))
-        
-        if not contacts.users:
-            await client.disconnect()
-            buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
-            msg = format_message("TIDAK ADA KONTAK ℹ️", 
-                               f"Akun **{nomor}** tidak punya kontak untuk di-clear.")
             await event.edit(msg, buttons=buttons)
             return
         
-        # Delete all contacts
-        user_ids = [user.id for user in contacts.users]
-        await client(DeleteContactsRequest(user_ids))
+        buttons = []
+        for kategori in kategori_list:
+            buttons.append([Button.inline(f"📁 {kategori.nama}", f"invite_grup_kat_{kategori.id}".encode())])
         
-        await client.disconnect()
+        buttons.append([Button.inline("🔙 Kembali", b"back_to_main")])
         
-        buttons = [[Button.inline("🔙 Kembali ke Menu", "back_to_main")]]
-        msg = format_message("KONTAK BERHASIL DI-CLEAR! ✅", 
-                           f"**{len(user_ids)} kontak** berhasil dihapus dari akun **{nomor}**!")
-        
-        await event.edit(msg, buttons=buttons)
-        
-    except Exception as e:
-        await event.answer(f"❌ Error: {str(e)}", alert=True)
-
-# Invite ke Grup/Channel Handler
-@bot.on(events.CallbackQuery(data=b'invite_grup'))
-async def invite_grup_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", b"back_to_main")]]
-        msg = format_message(
-            "BELUM ADA KATEGORI", 
-            "Belum ada kategori yang dibuat."
+        msg = self.formatter.format_message(
+            "INVITE KE GRUP/CHANNEL",
+            "Pilih kategori akun yang ingin digunakan:"
         )
         await event.edit(msg, buttons=buttons)
-        return
     
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([
-            Button.inline(f"📁 {kat_nama}", f"invite_grup_kat_{kat_id}".encode())
-        ])
+    # ==================== UTILITY METHODS ====================
+    async def _safe_disconnect_client(self, client):
+        """Safely disconnect Telethon client"""
+        try:
+            if client and client.is_connected():
+                await client.disconnect()
+        except Exception as e:
+            self.logger.error(f"Error disconnecting client: {e}")
     
-    buttons.append([Button.inline("🔙 Kembali", b"back_to_main")])
-    
-    msg = format_message(
-        "INVITE KE GRUP/CHANNEL 👥", 
-        "Pilih kategori akun yang mau dipake:"
-    )
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'invite_grup_kat_(\d+)'))
-async def invite_grup_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    
-    # Get kategori name and akun list
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        buttons = [[Button.inline("🔙 Kembali", "invite_grup")]]
-        msg = format_message(f"KATEGORI: {kategori_nama.upper()}", 
-                           "Belum ada akun di kategori ini.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for akun_id, nomor, nama_akun in akun_list:
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        buttons.append([Button.inline(f"👥 {display_name}", f"pilih_akun_invite_{akun_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "invite_grup")])
-    
-    msg = format_message(f"PILIH AKUN - {kategori_nama.upper()}", 
-                       "Pilih akun yang mau dipake buat invite kontak:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'pilih_akun_invite_(\d+)'))
-async def pilih_akun_invite_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    
-    user_states[event.sender_id] = {
-        "action": "invite_input_grup",
-        "akun_id": akun_id
-    }
-    
-    msg = format_message("INPUT GRUP/CHANNEL 📝", 
-                       "Kirim username grup/channel atau invite link nya:\n\n" +
-                       "**Contoh:**\n" +
-                       "• @namagrup\n" +
-                       "• https://t.me/namagrup\n" +
-                       "• https://t.me/+AbCdEfGhIjK")
-    
-    await event.edit(msg)
-
-# Edit Kategori Handler (Admin Utama Only)
-@bot.on(events.CallbackQuery(data=b'edit_kategori'))
-async def edit_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", "main_admin_menu")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📝 {kat_nama}", f"edit_kat_{kat_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "main_admin_menu")])
-    
-    msg = format_message("EDIT KATEGORI 📝", 
-                        "Pilih kategori yang mau diedit:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'edit_kat_(\d+)'))
-async def edit_kategori_nama_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    
-    # Get current kategori name
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    
-    user_states[event.sender_id] = {
-        "action": "edit_nama_kategori",
-        "kategori_id": kategori_id,
-        "old_name": kategori_nama
-    }
-    
-    msg = format_message("EDIT NAMA KATEGORI ✏️", 
-                       f"**Nama saat ini:** {kategori_nama}\n\n" +
-                       "Kirim nama baru buat kategori ini:")
-    
-    await event.edit(msg)
-
-# Pindah Kategori Handler (Admin Utama Only)
-@bot.on(events.CallbackQuery(data=b'pindah_kategori'))
-async def pindah_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", "main_admin_menu")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"pindah_dari_kat_{kat_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "main_admin_menu")])
-    
-    msg = format_message("PINDAH NOMOR KATEGORI 🔄", 
-                        "Pilih kategori ASAL (kategori yang punya nomor yang mau dipindah):")
-    await event.edit(msg, buttons=buttons)
-
-# Pindah Nomor Kategori Handlers
-@bot.on(events.CallbackQuery(pattern=r'pindah_dari_kat_(\d+)'))
-async def pindah_dari_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    
-    # Get kategori name and akun list
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        buttons = [[Button.inline("🔙 Kembali", "pindah_kategori")]]
-        msg = format_message(f"KATEGORI: {kategori_nama.upper()}", 
-                           "Belum ada akun di kategori ini.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    buttons = []
-    for akun_id, nomor, nama_akun in akun_list:
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        buttons.append([Button.inline(f"📱 {display_name}", f"pilih_nomor_pindah_{akun_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "pindah_kategori")])
-    
-    msg = format_message(f"PILIH NOMOR - {kategori_nama.upper()}", 
-                       "Pilih nomor yang mau dipindah:")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'pilih_nomor_pindah_(\d+)'))
-async def pilih_nomor_pindah_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    
-    # Get akun info
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    nama_akun = akun.get('nama_akun', '')
-    current_kategori_id = akun['kategori_id']
-    
-    # Get all kategori except current
-    all_kategori = get_kategori()
-    other_kategori = [(kat_id, kat_nama) for kat_id, kat_nama in all_kategori if kat_id != current_kategori_id]
-    
-    if not other_kategori:
-        buttons = [[Button.inline("🔙 Kembali", "pindah_kategori")]]
-        msg = format_message("TIDAK ADA KATEGORI LAIN", 
-                           "Tidak ada kategori lain untuk memindahkan nomor ini.")
-        await event.edit(msg, buttons=buttons)
-        return
-    
-    display_name = f"{nomor}"
-    if nama_akun:
-        display_name += f" ({nama_akun})"
-    
-    buttons = []
-    for kat_id, kat_nama in other_kategori:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"pindah_ke_kat_{akun_id}_{kat_id}")])
-    
-    buttons.append([Button.inline("🔙 Kembali", "pindah_kategori")])
-    
-    msg = format_message("PILIH KATEGORI TUJUAN 🎯", 
-                       f"Mau pindahin **{display_name}** ke kategori mana?")
-    await event.edit(msg, buttons=buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'pindah_ke_kat_(\d+)_(\d+)'))
-async def pindah_ke_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    data_parts = event.data.decode().split('_')
-    akun_id = int(data_parts[-2])
-    new_kategori_id = int(data_parts[-1])
-    
-    # Get akun info
-    akun = get_akun_by_id(akun_id)
-    
-    # Get kategori names
-    kategori = get_kategori_by_id(new_kategori_id)
-    
-    if not akun or not kategori:
-        await event.answer("❌ Data tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    nama_akun = akun.get('nama_akun', '')
-    kategori_nama = kategori['nama']
-    
-    # Update kategori
-    if update_akun_kategori(akun_id, new_kategori_id):
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        
-        buttons = [[Button.inline("🔙 Kembali ke Menu Admin", "main_admin_menu")]]
-        msg = format_message("NOMOR BERHASIL DIPINDAH! ✅", 
-                           f"**Nomor:** {display_name}\n" +
-                           f"**Kategori baru:** {kategori_nama}")
-        
-        await event.edit(msg, buttons=buttons)
-    else:
-        await event.answer("❌ Gagal memindahkan nomor!", alert=True)
-
-# Error Handler
-@bot.on(events.NewMessage)
-async def error_handler(event):
-    # Skip if already handled by other handlers
-    if event.message.text and (event.message.text.startswith('/') or 
-                               event.sender_id not in user_states):
-        return
-    
-    # Handle unknown messages
-    if not is_authorized(event.sender_id):
-        return
-    
-    user_id = event.sender_id
-    if user_id in user_states:
-        state = user_states[user_id]
-        
-        # Handle states that expect text input but not handled by state_message_handler
-        expected_text_states = ["buat_kategori", "edit_nama_kategori", "invite_input_grup", 
-                               "login_step1", "login_step2", "login_step2_password", 
-                               "tambah_admin"]
-        
-        if state["action"] not in expected_text_states:
-            await event.reply("❌ **Perintah tidak dikenali!**\n\n" + 
-                            "Gunakan tombol yang tersedia atau ketik /start untuk kembali ke menu utama.")
-
-# Main Function
-async def main():
-    """Main function untuk menjalankan bot"""
-    
-    print("🤖 Bot Telegram Manager dimulai...")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    
-    try:
-        # Initialize storage
-        print("📁 Menginisialisasi JSON storage...")
-        storage.ensure_data_dir()
-        storage.init_json_files()
-        print("✅ JSON storage berhasil diinisialisasi")
-        
-        # Test JSON operations
-        print("🔍 Testing JSON operations...")
-        test_data = storage.read_json(KATEGORI_FILE)
-        storage.write_json(KATEGORI_FILE, test_data)
-        print("✅ JSON operations working properly")
-        
-        # Initialize bot
-        print("🤖 Menginisialisasi bot...")
-        await bot.start(bot_token=BOT_TOKEN)
-        
-        # Get bot info
-        me = await bot.get_me()
-        print(f"✅ Bot berhasil login sebagai @{me.username}")
-        print(f"📊 Bot ID: {me.id}")
-        
-        # Show statistics
-        kategori_count = len(get_kategori())
-        akun_count = len(storage.read_json(AKUN_TG_FILE))
-        admin_count = len(get_all_admin_bots())
-        
-        print(f"📈 Statistik saat ini:")
-        print(f"   📁 Kategori: {kategori_count}")
-        print(f"   📱 Akun TG: {akun_count}")
-        print(f"   👨‍💼 Admin Bot: {admin_count}")
-        
-        print("🚀 Bot siap digunakan!")
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        
-        # Keep bot running
-        await bot.run_until_disconnected()
-        
-    except Exception as e:
-        print(f"❌ Error saat inisialisasi bot: {e}")
-        import traceback
-        traceback.print_exc()
-        if bot and bot.is_connected():
-            await bot.disconnect()
-
-# Health Check Function
-def health_check():
-    """Check kesehatan JSON files"""
-    try:
-        # Check if data directory exists
-        if not os.path.exists(DATA_DIR):
-            print("❌ Data directory tidak ditemukan!")
+    def _validate_phone_number(self, phone: str) -> bool:
+        """Validate phone number format"""
+        if not phone.startswith('+'):
             return False
         
-        # Check if all JSON files are readable
-        files_to_check = [KATEGORI_FILE, AKUN_TG_FILE, TEMP_CONTACTS_FILE, ADMIN_BOTS_FILE]
+        # Remove + and check if remaining chars are digits
+        digits = phone[1:]
+        if not digits.isdigit():
+            return False
         
-        for file_path in files_to_check:
-            data = storage.read_json(file_path)
+        # Basic length validation (7-15 digits)
+        return 7 <= len(digits) <= 15
+    
+    async def _get_user_display_name(self, user_id: int) -> str:
+        """Get user display name"""
+        try:
+            user = await self.bot.get_entity(user_id)
+            name = user.first_name
+            if user.last_name:
+                name += f" {user.last_name}"
+            if user.username:
+                name += f" (@{user.username})"
+            return name
+        except Exception:
+            return f"User ID: {user_id}"
+    
+    # ==================== BOT LIFECYCLE ====================
+    async def start(self):
+        """Start the bot"""
+        try:
+            self.logger.info("🤖 Starting Telegram Bot Manager...")
+            
+            # Create backup
+            self.logger.info("💾 Creating backup...")
+            self.storage.create_backup()
+            
+            # Cleanup old backups
+            self.logger.info("🧹 Cleaning up old backups...")
+            self.storage.cleanup_old_backups(config.BACKUP_RETENTION_DAYS)
+            
+            # Start bot
+            await self.bot.start(bot_token=config.BOT_TOKEN)
+            
+            # Get bot info
+            me = await self.bot.get_me()
+            self.logger.info(f"✅ Bot successfully logged in as @{me.username}")
+            self.logger.info(f"📊 Bot ID: {me.id}")
+            
+            # Show statistics
+            kategori_count = len(self.db.get_all_kategori())
+            akun_count = len(self.storage.read_json('akun_tg'))
+            admin_count = len(self.db.get_all_admin_bots())
+            
+            self.logger.info(f"📈 Current statistics:")
+            self.logger.info(f"   📁 Categories: {kategori_count}")
+            self.logger.info(f"   📱 TG Accounts: {akun_count}")
+            self.logger.info(f"   👨‍💼 Bot Admins: {admin_count}")
+            
+            self.logger.info("🚀 Bot is ready to use!")
+            
+            # Keep bot running
+            await self.bot.run_until_disconnected()
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error starting bot: {e}")
+            raise
+        finally:
+            if self.bot.is_connected():
+                await self.bot.disconnect()
+    
+    async def stop(self):
+        """Stop the bot gracefully"""
+        self.logger.info("💤 Stopping bot...")
+        if self.bot.is_connected():
+            await self.bot.disconnect()
+        self.logger.info("👋 Bot stopped successfully!")
+
+# ==================== ADDITIONAL HANDLERS ====================
+# Additional callback and message handlers can be added here
+# This includes handlers for:
+# - Admin management (add/remove admins)
+# - Category editing
+# - Account deletion
+# - Contact clearing
+# - Group/channel inviting
+# - Account migration between categories
+
+# ==================== MAIN FUNCTION ====================
+async def main():
+    """Main function to run the bot"""
+    bot_manager = None
+    
+    try:
+        # Initialize bot manager
+        bot_manager = TelegramBotManager()
+        
+        # Start bot
+        await bot_manager.start()
+        
+    except KeyboardInterrupt:
+        print("\n💤 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if bot_manager:
+            await bot_manager.stop()
+        print("👋 Thank you for using Telegram Bot Manager!")
+
+# ==================== HEALTH CHECK ====================
+def health_check() -> bool:
+    """Check the health of JSON files"""
+    try:
+        storage = StorageManager(config.DATA_DIR)
+        
+        # Check if all files are readable
+        for file_type in ['kategori', 'akun_tg', 'temp_contacts', 'admin_bots']:
+            data = storage.read_json(file_type)
             if not isinstance(data, list):
-                print(f"❌ File {file_path} format tidak valid!")
+                print(f"❌ File {file_type} has invalid format!")
                 return False
         
-        print("✅ Semua JSON files sehat")
+        print("✅ All JSON files are healthy")
         return True
         
     except Exception as e:
         print(f"❌ Health check error: {e}")
         return False
 
-# Backup Function
-def create_backup():
-    """Buat backup dari semua data JSON"""
+# ==================== CLI UTILITIES ====================
+def create_manual_backup():
+    """Create manual backup"""
     try:
-        import shutil
-        from datetime import datetime
-        
-        backup_dir = os.path.join(DATA_DIR, "backups")
-        if not os.path.exists(backup_dir):
-            os.makedirs(backup_dir)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_subdir = os.path.join(backup_dir, f"backup_{timestamp}")
-        os.makedirs(backup_subdir)
-        
-        files_to_backup = [KATEGORI_FILE, AKUN_TG_FILE, TEMP_CONTACTS_FILE, ADMIN_BOTS_FILE]
-        
-        for file_path in files_to_backup:
-            if os.path.exists(file_path):
-                filename = os.path.basename(file_path)
-                backup_path = os.path.join(backup_subdir, filename)
-                shutil.copy2(file_path, backup_path)
-        
-        print(f"✅ Backup berhasil dibuat di: {backup_subdir}")
-        return backup_subdir
-        
+        storage = StorageManager(config.DATA_DIR)
+        backup_path = storage.create_backup()
+        if backup_path:
+            print(f"✅ Manual backup created: {backup_path}")
+        else:
+            print("❌ Failed to create backup")
     except Exception as e:
         print(f"❌ Backup error: {e}")
-        return None
 
-# Cleanup Function
-def cleanup_old_backups(keep_days=7):
-    """Hapus backup lama"""
+def show_statistics():
+    """Show current statistics"""
     try:
-        import time
+        db = DatabaseManager(StorageManager(config.DATA_DIR))
         
-        backup_dir = os.path.join(DATA_DIR, "backups")
-        if not os.path.exists(backup_dir):
-            return
+        kategori_count = len(db.get_all_kategori())
+        akun_count = len(db.storage.read_json('akun_tg'))
+        admin_count = len(db.get_all_admin_bots())
         
-        current_time = time.time()
-        cutoff_time = current_time - (keep_days * 24 * 60 * 60)  # keep_days dalam detik
-        
-        removed_count = 0
-        for backup_folder in os.listdir(backup_dir):
-            backup_path = os.path.join(backup_dir, backup_folder)
-            if os.path.isdir(backup_path):
-                folder_time = os.path.getctime(backup_path)
-                if folder_time < cutoff_time:
-                    import shutil
-                    shutil.rmtree(backup_path)
-                    removed_count += 1
-        
-        if removed_count > 0:
-            print(f"🧹 {removed_count} backup lama berhasil dihapus")
+        print("📈 Current Statistics:")
+        print(f"   📁 Categories: {kategori_count}")
+        print(f"   📱 TG Accounts: {akun_count}")
+        print(f"   👨‍💼 Bot Admins: {admin_count}")
         
     except Exception as e:
-        print(f"❌ Cleanup error: {e}")
+        print(f"❌ Error showing statistics: {e}")
 
-# Entry Point
+# ==================== ENTRY POINT ====================
 if __name__ == '__main__':
+    import sys
+    
+    # Handle CLI arguments
+    if len(sys.argv) > 1:
+        command = sys.argv[1].lower()
+        
+        if command == 'health':
+            health_check()
+            sys.exit(0)
+        elif command == 'backup':
+            create_manual_backup()
+            sys.exit(0)
+        elif command == 'stats':
+            show_statistics()
+            sys.exit(0)
+        elif command == 'help':
+            print("Available commands:")
+            print("  python bot.py health  - Check JSON files health")
+            print("  python bot.py backup  - Create manual backup")
+            print("  python bot.py stats   - Show statistics")
+            print("  python bot.py         - Start bot (default)")
+            sys.exit(0)
+    
     try:
-        # Run health check
-        print("🏥 Menjalankan health check...")
+        # Run health check before starting
+        print("🏥 Running health check...")
         if not health_check():
-            print("❌ Health check gagal! Memperbaiki struktur data...")
-            storage = JSONStorage()  # Reinitialize
-
-        # Create backup
-        print("💾 Membuat backup...")
-        create_backup()
-
-        # Cleanup old backups
-        print("🧹 Membersihkan backup lama...")
-        cleanup_old_backups()
-
-        # ✅ Pakai asyncio.run() -> aman, loop hanya sekali
+            print("❌ Health check failed! Attempting to fix...")
+            # Try to reinitialize storage
+            try:
+                StorageManager(config.DATA_DIR)
+                print("✅ Storage reinitialized")
+            except Exception as e:
+                print(f"❌ Failed to reinitialize storage: {e}")
+                sys.exit(1)
+        
+        # Run bot
         asyncio.run(main())
-
+        
     except KeyboardInterrupt:
-        print("\n💤 Bot dihentikan oleh user")
+        print("\n💤 Bot stopped by user")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
-    finally:
-        print("👋 Terima kasih telah menggunakan Bot Telegram Manager!")
+        sys.exit(1)
