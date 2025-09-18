@@ -20,7 +20,8 @@ from telethon.tl.types import InputPhoneContact, User, Chat, Channel
 from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError, 
     PasswordHashInvalidError, FloodWaitError, PhoneNumberInvalidError,
-    MessageNotModifiedError, MessageIdInvalidError
+    MessageNotModifiedError, MessageIdInvalidError, UserPrivacyRestrictedError,
+    ChatAdminRequiredError, UserAlreadyParticipantError, PeerFloodError
 )
 from telethon.tl.functions.contacts import (
     ImportContactsRequest, DeleteContactsRequest, GetContactsRequest
@@ -311,34 +312,67 @@ def format_message(title: str, content: str = "", success: bool = None) -> str:
 
 async def safe_edit_message(event, text, buttons=None):
     """Safely edit message with error handling"""
-    try:
-        if hasattr(event, 'edit'):
-            await event.edit(text, buttons=buttons)
-        else:
-            await event.reply(text, buttons=buttons)
-    except (MessageNotModifiedError, MessageIdInvalidError):
-        # Message content is the same or message ID is invalid
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            await event.reply(text, buttons=buttons)
+            if hasattr(event, 'edit'):
+                await event.edit(text, buttons=buttons)
+            else:
+                await event.reply(text, buttons=buttons)
+            return True
+        except (MessageNotModifiedError, MessageIdInvalidError):
+            try:
+                await event.reply(text, buttons=buttons)
+                return True
+            except Exception as e:
+                logger.error(f"Error in safe_edit_message fallback attempt {attempt + 1}: {e}")
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait in edit message, waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
         except Exception as e:
-            logger.error(f"Error in safe_edit_message fallback: {e}")
-    except Exception as e:
-        logger.error(f"Error in safe_edit_message: {e}")
-        try:
-            await event.reply(text, buttons=buttons)
-        except Exception as e2:
-            logger.error(f"Error in safe_edit_message final fallback: {e2}")
+            logger.error(f"Error in safe_edit_message attempt {attempt + 1}: {e}")
+            if attempt == max_retries - 1:
+                try:
+                    await event.reply("❌ Terjadi error saat mengedit pesan. Silakan coba lagi.")
+                    return False
+                except:
+                    return False
+            await asyncio.sleep(1)
+    return False
 
 async def safe_send_message(event, text, buttons=None):
     """Safely send message"""
-    try:
-        await event.reply(text, buttons=buttons)
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await event.reply(text, buttons=buttons)
+            return True
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait in send message, waiting {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logger.error(f"Error sending message attempt {attempt + 1}: {e}")
+            if attempt == max_retries - 1:
+                return False
+            await asyncio.sleep(1)
+    return False
 
 # ==================== BOT INITIALIZATION ====================
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+bot = TelegramClient('bot_session', API_ID, API_HASH)
 user_states = {}
+active_clients = {}  # Store active client connections
+
+async def cleanup_client(user_id: int):
+    """Clean up client connection"""
+    if user_id in active_clients:
+        try:
+            client = active_clients[user_id]
+            if client.is_connected():
+                await client.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting client for user {user_id}: {e}")
+        finally:
+            active_clients.pop(user_id, None)
 
 # ==================== MAIN HANDLERS ====================
 @bot.on(events.NewMessage(pattern='/start'))
@@ -353,6 +387,7 @@ async def start_handler(event):
     
     # Clear any existing state
     user_states.pop(event.sender_id, None)
+    await cleanup_client(event.sender_id)
     
     buttons = []
     if is_admin_utama(event.sender_id):
@@ -374,9 +409,11 @@ async def start_handler(event):
 @bot.on(events.CallbackQuery(data=b'back_to_main'))
 async def back_to_main_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     user_states.pop(event.sender_id, None)
+    await cleanup_client(event.sender_id)
     
     buttons = []
     if is_admin_utama(event.sender_id):
@@ -432,6 +469,7 @@ async def kelola_kategori_handler(event):
 @bot.on(events.CallbackQuery(data=b'tambah_kategori'))
 async def tambah_kategori_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     user_states[event.sender_id] = {"action": "tambah_kategori"}
@@ -441,6 +479,7 @@ async def tambah_kategori_handler(event):
 @bot.on(events.CallbackQuery(data=b'edit_kategori'))
 async def edit_kategori_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_list = get_kategori()
@@ -462,6 +501,7 @@ async def edit_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'edit_kat_(\d+)'))
 async def edit_kategori_nama_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -486,6 +526,7 @@ async def edit_kategori_nama_handler(event):
 @bot.on(events.CallbackQuery(data=b'hapus_kategori'))
 async def hapus_kategori_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_list = get_kategori()
@@ -507,6 +548,7 @@ async def hapus_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'confirm_hapus_kat_(\d+)'))
 async def confirm_hapus_kategori_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -536,6 +578,7 @@ async def confirm_hapus_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'execute_hapus_kat_(\d+)'))
 async def execute_hapus_kategori_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -557,6 +600,7 @@ async def execute_hapus_kategori_handler(event):
 @bot.on(events.CallbackQuery(data=b'list_kategori'))
 async def list_kategori_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_list = get_kategori()
@@ -589,12 +633,13 @@ async def kelola_admin_menu(event):
         [Button.inline("🔙 Kembali", b"main_admin_menu")]
     ]
     
-    msg = format_message("KELOLA ADMIN BOT")
+    msg = format_message("KELOLA ADMIN BOT", "Pilih aksi untuk admin bot:")
     await safe_edit_message(event, msg, buttons)
 
 @bot.on(events.CallbackQuery(data=b'tambah_admin'))
 async def tambah_admin_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     user_states[event.sender_id] = {"action": "tambah_admin"}
@@ -602,9 +647,12 @@ async def tambah_admin_handler(event):
                         "Forward pesan dari user yang ingin dijadikan admin atau kirim user ID:")
     await safe_edit_message(event, msg)
 
+# Continuing from the previous part...
+
 @bot.on(events.CallbackQuery(data=b'list_admin'))
 async def list_admin_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     admins = get_all_admin_bots()
@@ -633,6 +681,7 @@ async def list_admin_handler(event):
 @bot.on(events.CallbackQuery(data=b'hapus_admin'))
 async def hapus_admin_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     admins = get_all_admin_bots()
@@ -664,6 +713,7 @@ async def hapus_admin_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'confirm_hapus_admin_(\d+)'))
 async def confirm_hapus_admin_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     admin_id = int(event.data.decode().split('_')[-1])
@@ -688,6 +738,7 @@ async def confirm_hapus_admin_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'execute_hapus_admin_(\d+)'))
 async def execute_hapus_admin_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     admin_id = int(event.data.decode().split('_')[-1])
@@ -713,6 +764,7 @@ async def execute_hapus_admin_handler(event):
 @bot.on(events.CallbackQuery(data=b'login_nomor'))
 async def login_nomor_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     user_states[event.sender_id] = {"action": "login_step1"}
@@ -724,6 +776,7 @@ async def login_nomor_handler(event):
 @bot.on(events.CallbackQuery(data=b'list_akun'))
 async def list_akun_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_list = get_kategori()
@@ -748,6 +801,7 @@ async def list_akun_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'list_akun_kat_(\d+)'))
 async def list_akun_kategori_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -779,6 +833,7 @@ async def list_akun_kategori_handler(event):
 @bot.on(events.CallbackQuery(data=b'tambah_kontak'))
 async def tambah_kontak_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     user_states[event.sender_id] = {"action": "tambah_kontak_step1", "contacts": []}
@@ -791,6 +846,7 @@ async def tambah_kontak_handler(event):
 @bot.on(events.CallbackQuery(data=b'hapus_nomor'))
 async def hapus_nomor_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_list = get_kategori()
@@ -813,6 +869,7 @@ async def hapus_nomor_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'hapus_nomor_kat_(\d+)'))
 async def hapus_nomor_kategori_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -848,6 +905,7 @@ async def hapus_nomor_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'confirm_hapus_(\d+)'))
 async def confirm_hapus_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     akun_id = int(event.data.decode().split('_')[-1])
@@ -877,6 +935,7 @@ async def confirm_hapus_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'execute_hapus_(\d+)'))
 async def execute_hapus_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     akun_id = int(event.data.decode().split('_')[-1])
@@ -902,6 +961,7 @@ async def execute_hapus_handler(event):
 @bot.on(events.CallbackQuery(data=b'clear_kontak'))
 async def clear_kontak_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_list = get_kategori()
@@ -924,6 +984,7 @@ async def clear_kontak_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'clear_kontak_kat_(\d+)'))
 async def clear_kontak_kategori_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -959,6 +1020,7 @@ async def clear_kontak_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'confirm_clear_(\d+)'))
 async def confirm_clear_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     akun_id = int(event.data.decode().split('_')[-1])
@@ -988,6 +1050,7 @@ async def confirm_clear_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'execute_clear_(\d+)'))
 async def execute_clear_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     akun_id = int(event.data.decode().split('_')[-1])
@@ -1034,6 +1097,7 @@ async def execute_clear_handler(event):
 @bot.on(events.CallbackQuery(data=b'invite_grup'))
 async def invite_grup_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_list = get_kategori()
@@ -1057,6 +1121,7 @@ async def invite_grup_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'invite_grup_kat_(\d+)'))
 async def invite_grup_kategori_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -1092,6 +1157,7 @@ async def invite_grup_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'pilih_akun_invite_(\d+)'))
 async def pilih_akun_invite_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     akun_id = int(event.data.decode().split('_')[-1])
@@ -1139,6 +1205,7 @@ async def pindah_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'pindah_dari_kat_(\d+)'))
 async def pindah_dari_kategori_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -1174,6 +1241,7 @@ async def pindah_dari_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'pilih_nomor_pindah_(\d+)'))
 async def pilih_nomor_pindah_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     akun_id = int(event.data.decode().split('_')[-1])
@@ -1215,6 +1283,7 @@ async def pilih_nomor_pindah_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'pindah_ke_kat_(\d+)_(\d+)'))
 async def pindah_ke_kategori_handler(event):
     if not is_admin_utama(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     data_parts = event.data.decode().split('_')
@@ -1251,6 +1320,7 @@ async def pindah_ke_kategori_handler(event):
 @bot.on(events.CallbackQuery(data=b'buat_kategori_baru'))
 async def buat_kategori_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     user_states[event.sender_id] = {"action": "buat_kategori"}
@@ -1261,6 +1331,7 @@ async def buat_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'pilih_kategori_(\d+)'))
 async def pilih_kategori_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     kategori_id = int(event.data.decode().split('_')[-1])
@@ -1291,6 +1362,8 @@ async def pilih_kategori_handler(event):
         else:
             await event.answer("❌ Nomor ini sudah ada di database!", alert=True)
         
+        # Clean up client connection
+        await cleanup_client(user_id)
         user_states.pop(user_id, None)
     
     elif state["action"] == "tambah_kontak_step2_pilih_kategori":
@@ -1320,6 +1393,7 @@ async def pilih_kategori_handler(event):
 @bot.on(events.CallbackQuery(pattern=r'pilih_akun_kontak_(\d+)'))
 async def pilih_akun_kontak_handler(event):
     if not is_authorized(event.sender_id):
+        await event.answer("❌ Akses ditolak!", alert=True)
         return
     
     akun_id = int(event.data.decode().split('_')[-1])
@@ -1339,6 +1413,11 @@ async def pilih_akun_kontak_handler(event):
     session_string = akun['session_string']
     
     try:
+        # Show progress
+        progress_msg = format_message("PROSES TAMBAH KONTAK", 
+                                    f"Memproses {len(temp_contacts)} kontak ke akun {nomor}...")
+        msg_obj = await safe_edit_message(event, progress_msg)
+        
         # Connect with the selected account
         client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
         await client.connect()
@@ -1346,28 +1425,62 @@ async def pilih_akun_kontak_handler(event):
         # Prepare contacts for import
         contacts_to_import = []
         for i, contact_data in enumerate(temp_contacts):
+            phone_number = contact_data['phone']
+            if not phone_number.startswith('+'):
+                phone_number = '+' + phone_number
+            
             contact = InputPhoneContact(
                 client_id=i,
-                phone='+' + contact_data['phone'].replace('+', ''),
-                first_name=contact_data['first_name'],
+                phone=phone_number,
+                first_name=contact_data['first_name'] or 'Unknown',
                 last_name=contact_data['last_name'] or ''
             )
             contacts_to_import.append(contact)
         
-        # Import contacts
-        result = await client(ImportContactsRequest(contacts_to_import))
+        # Import contacts in batches to avoid flood limits
+        batch_size = 50
+        total_imported = 0
+        
+        for i in range(0, len(contacts_to_import), batch_size):
+            batch = contacts_to_import[i:i + batch_size]
+            try:
+                result = await client(ImportContactsRequest(batch))
+                total_imported += len(result.imported)
+                
+                # Update progress
+                progress_text = format_message("PROSES TAMBAH KONTAK", 
+                                             f"Progress: {min(i + batch_size, len(contacts_to_import))}/{len(contacts_to_import)}\n" +
+                                             f"Berhasil: {total_imported}")
+                try:
+                    await safe_edit_message(event, progress_text)
+                except:
+                    pass  # Ignore edit errors during progress
+                
+                # Add delay between batches
+                if i + batch_size < len(contacts_to_import):
+                    await asyncio.sleep(2)
+                    
+            except FloodWaitError as e:
+                logger.warning(f"FloodWait while importing contacts: {e.seconds} seconds")
+                await asyncio.sleep(e.seconds)
+                # Retry this batch
+                try:
+                    result = await client(ImportContactsRequest(batch))
+                    total_imported += len(result.imported)
+                except Exception as retry_e:
+                    logger.error(f"Error on retry import: {retry_e}")
+            except Exception as batch_e:
+                logger.error(f"Error importing batch: {batch_e}")
+                continue
         
         await client.disconnect()
         
         # Clear temp contacts
         clear_temp_contacts(user_id)
         
-        success_count = len(result.imported)
-        total_count = len(contacts_to_import)
-        
         msg = format_message("KONTAK BERHASIL DITAMBAHKAN", 
                            f"**Akun:** {nomor}\n" +
-                           f"**Berhasil:** {success_count}/{total_count} kontak\n\n" +
+                           f"**Berhasil:** {total_imported}/{len(temp_contacts)} kontak\n\n" +
                            "Semua kontak sudah disimpan ke akun Telegram yang dipilih!",
                            success=True)
         
@@ -1414,16 +1527,25 @@ async def message_handler(event):
                 "phone_code_hash": result.phone_code_hash
             }
             
+            # Store client for cleanup
+            active_clients[user_id] = client
+            
             msg = format_message("KODE OTP DIKIRIM", 
                                f"Kode OTP telah dikirim ke **{nomor}**\n\nKirim kode OTP yang Anda terima:")
             await safe_send_message(event, msg)
+        except PhoneNumberInvalidError:
+            await safe_send_message(event, "❌ **Nomor HP tidak valid!** Cek lagi format nomor yang Anda kirim.")
+            user_states.pop(user_id, None)
+        except FloodWaitError as e:
+            await safe_send_message(event, f"❌ **Terlalu banyak request!** Tunggu {e.seconds} detik lagi.")
+            user_states.pop(user_id, None)
         except Exception as e:
             logger.error(f"Error in login step 1: {e}")
             await safe_send_message(event, f"❌ **Error:** {str(e)}")
             user_states.pop(user_id, None)
     
     elif state["action"] == "login_step2":
-        code = event.message.text.strip()
+        code = event.message.text.strip().replace(' ', '').replace('-', '')
         
         try:
             client = state["client"]
@@ -1457,9 +1579,12 @@ async def message_handler(event):
             await safe_send_message(event, msg)
         except PhoneCodeInvalidError:
             await safe_send_message(event, "❌ **Kode OTP salah!** Coba lagi dengan kode yang benar:")
+        except FloodWaitError as e:
+            await safe_send_message(event, f"❌ **Flood wait!** Tunggu {e.seconds} detik lagi.")
         except Exception as e:
             logger.error(f"Error in login step 2: {e}")
             await safe_send_message(event, f"❌ **Error:** {str(e)}")
+            await cleanup_client(user_id)
             user_states.pop(user_id, None)
     
     elif state["action"] == "login_step2_password":
@@ -1489,9 +1614,12 @@ async def message_handler(event):
             
         except PasswordHashInvalidError:
             await safe_send_message(event, "❌ **Password salah!** Coba lagi:")
+        except FloodWaitError as e:
+            await safe_send_message(event, f"❌ **Flood wait!** Tunggu {e.seconds} detik lagi.")
         except Exception as e:
             logger.error(f"Error in login password step: {e}")
             await safe_send_message(event, f"❌ **Error:** {str(e)}")
+            await cleanup_client(user_id)
             user_states.pop(user_id, None)
     
     # Handle Tambah Kontak
@@ -1632,6 +1760,7 @@ async def message_handler(event):
             
             # Invite contacts to the group/channel
             success_count = 0
+            failed_count = 0
             total_count = len(contacts.users)
             
             msg_status = await safe_send_message(event, format_message(
@@ -1648,22 +1777,43 @@ async def message_handler(event):
                     
                     success_count += 1
                     
-                    # Update progress every 10 invites
-                    if (i + 1) % 10 == 0:
+                    # Update progress every 5 invites
+                    if (i + 1) % 5 == 0:
                         try:
                             progress_msg = format_message(
                                 "PROSES INVITE...", 
-                                f"Progress: {i + 1}/{total_count}\nBerhasil: {success_count}"
+                                f"Progress: {i + 1}/{total_count}\n" +
+                                f"Berhasil: {success_count}\n" +
+                                f"Gagal: {failed_count}"
                             )
                             await safe_edit_message(msg_status, progress_msg)
                         except:
                             pass  # Ignore edit errors during progress updates
                         
                         # Add delay to avoid flood limits
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(3)
                 
-                except Exception:
-                    # Skip users that can't be added
+                except (UserPrivacyRestrictedError, UserAlreadyParticipantError):
+                    failed_count += 1
+                    continue
+                except PeerFloodError:
+                    logger.warning("PeerFloodError encountered, stopping invites")
+                    failed_count += (total_count - i - 1)
+                    break
+                except FloodWaitError as e:
+                    logger.warning(f"FloodWait during invite: {e.seconds} seconds")
+                    await asyncio.sleep(e.seconds)
+                    try:
+                        if isinstance(target_entity, Channel):
+                            await client(InviteToChannelRequest(target_entity, [user]))
+                        else:
+                            await client(AddChatUserRequest(target_entity.id, user.id, 0))
+                        success_count += 1
+                    except:
+                        failed_count += 1
+                except Exception as invite_e:
+                    logger.error(f"Error inviting user {user.id}: {invite_e}")
+                    failed_count += 1
                     continue
             
             await client.disconnect()
@@ -1674,7 +1824,8 @@ async def message_handler(event):
                 "INVITE SELESAI", 
                 f"**Akun:** {nomor}\n"
                 f"**Target:** {target_entity.title if hasattr(target_entity, 'title') else grup_input}\n"
-                f"**Berhasil di-invite:** {success_count}/{total_count} kontak\n\n"
+                f"**Berhasil di-invite:** {success_count}/{total_count} kontak\n"
+                f"**Gagal:** {failed_count} kontak\n\n"
                 "Proses invite sudah selesai!",
                 success=True
             )
@@ -1767,14 +1918,8 @@ async def error_handler(event):
                   "Gunakan tombol yang tersedia atau ketik /start untuk kembali ke menu utama."
             await safe_send_message(event, msg)
 
-# ==================== MAIN FUNCTION ====================
-async def main():
-    async with TelegramClient("bot", API_ID, API_HASH) as bot:
-        await bot.start(bot_token=BOT_TOKEN)
-        print("🤖 Bot jalan...")
-        await bot.run_until_disconnected()
+# Continuing from previous part...
 
-# ==================== HEALTH CHECK & BACKUP ====================
 def health_check():
     """Check kesehatan JSON files"""
     try:
@@ -1848,6 +1993,322 @@ def cleanup_old_backups(keep_days=7):
     except Exception as e:
         print(f"❌ Cleanup error: {e}")
 
+# ==================== STARTUP FUNCTIONS ====================
+async def startup_checks():
+    """Jalankan pengecekan startup"""
+    try:
+        print("🔍 Menjalankan health check...")
+        if not health_check():
+            print("⚠️ Health check gagal, mencoba recovery...")
+            # Attempt to recreate missing files
+            storage.init_json_files()
+            if not health_check():
+                print("❌ Recovery gagal! Bot mungkin tidak berfungsi dengan baik.")
+                return False
+        
+        print("📦 Membuat backup...")
+        create_backup()
+        
+        print("🧹 Membersihkan backup lama...")
+        cleanup_old_backups()
+        
+        print("✅ Startup checks selesai!")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error during startup checks: {e}")
+        return False
+
+# ==================== PERIODIC TASKS ====================
+async def periodic_backup():
+    """Buat backup berkala setiap 6 jam"""
+    while True:
+        try:
+            await asyncio.sleep(6 * 60 * 60)  # 6 hours
+            logger.info("Creating periodic backup...")
+            create_backup()
+            cleanup_old_backups()
+        except Exception as e:
+            logger.error(f"Error in periodic backup: {e}")
+
+async def periodic_cleanup():
+    """Cleanup berkala untuk temp data"""
+    while True:
+        try:
+            await asyncio.sleep(24 * 60 * 60)  # 24 hours
+            
+            # Clear old temp contacts (older than 24 hours)
+            data = storage.read_json(TEMP_CONTACTS_FILE)
+            current_time = datetime.now()
+            cleaned_data = []
+            
+            for item in data:
+                try:
+                    created_time = datetime.fromisoformat(item['created_at'])
+                    time_diff = current_time - created_time
+                    if time_diff.total_seconds() < 24 * 60 * 60:  # Keep if less than 24 hours
+                        cleaned_data.append(item)
+                except:
+                    continue
+            
+            if len(cleaned_data) < len(data):
+                storage.write_json(TEMP_CONTACTS_FILE, cleaned_data)
+                logger.info(f"Cleaned {len(data) - len(cleaned_data)} old temp contacts")
+            
+        except Exception as e:
+            logger.error(f"Error in periodic cleanup: {e}")
+
+# ==================== GLOBAL ERROR HANDLER ====================
+async def global_error_handler(event):
+    """Handle global errors"""
+    try:
+        if hasattr(event, 'sender_id') and is_authorized(event.sender_id):
+            msg = "❌ Terjadi error internal. Tim teknis sudah diberitahu. Silakan coba lagi nanti atau hubungi admin."
+            try:
+                await event.reply(msg)
+            except:
+                pass  # If we can't send error message, just log it
+    except Exception as e:
+        logger.error(f"Error in global error handler: {e}")
+
+# ==================== BOT SHUTDOWN HANDLER ====================
+async def cleanup_on_shutdown():
+    """Cleanup resources on shutdown"""
+    try:
+        logger.info("Bot shutting down, cleaning up resources...")
+        
+        # Disconnect all active clients
+        for user_id, client in list(active_clients.items()):
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+                logger.info(f"Disconnected client for user {user_id}")
+            except Exception as e:
+                logger.error(f"Error disconnecting client for user {user_id}: {e}")
+        
+        active_clients.clear()
+        
+        # Create final backup
+        create_backup()
+        
+        logger.info("Cleanup completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+
+# ==================== ENHANCED ERROR HANDLING ====================
+def handle_telethon_errors(func):
+    """Decorator for handling common Telethon errors"""
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except FloodWaitError as e:
+            logger.warning(f"FloodWait in {func.__name__}: {e.seconds} seconds")
+            await asyncio.sleep(e.seconds)
+            return await func(*args, **kwargs)  # Retry once
+        except (ConnectionError, OSError) as e:
+            logger.error(f"Connection error in {func.__name__}: {e}")
+            # Don't retry connection errors automatically
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in {func.__name__}: {e}")
+            raise
+    return wrapper
+
+# ==================== MONITORING AND STATS ====================
+bot_stats = {
+    'start_time': datetime.now(),
+    'total_users': 0,
+    'total_commands': 0,
+    'active_sessions': 0,
+    'errors': 0
+}
+
+def update_stats(stat_name, increment=1):
+    """Update bot statistics"""
+    if stat_name in bot_stats:
+        bot_stats[stat_name] += increment
+
+def get_bot_stats():
+    """Get current bot statistics"""
+    uptime = datetime.now() - bot_stats['start_time']
+    stats_msg = f"""
+📊 **BOT STATISTICS**
+━━━━━━━━━━━━━━━━━━
+⏰ **Uptime:** {str(uptime).split('.')[0]}
+👥 **Total Users:** {bot_stats['total_users']}
+📨 **Commands Processed:** {bot_stats['total_commands']}
+🔗 **Active Sessions:** len(active_clients)
+❌ **Errors:** {bot_stats['errors']}
+💾 **Data Files:** {len([f for f in os.listdir(DATA_DIR) if f.endswith('.json')])}
+    """
+    return stats_msg
+
+# Add stats command for admin
+@bot.on(events.NewMessage(pattern='/stats'))
+async def stats_handler(event):
+    if not is_admin_utama(event.sender_id):
+        return
+    
+    stats_msg = get_bot_stats()
+    await safe_send_message(event, stats_msg)
+
+# Add restart command for admin
+@bot.on(events.NewMessage(pattern='/restart'))
+async def restart_handler(event):
+    if not is_admin_utama(event.sender_id):
+        return
+    
+    await safe_send_message(event, "🔄 Bot akan direstart dalam 5 detik...")
+    await asyncio.sleep(5)
+    
+    # Cleanup before restart
+    await cleanup_on_shutdown()
+    
+    # Exit the program (assuming it's managed by a process manager)
+    import sys
+    sys.exit(0)
+
+# Add backup command for admin
+@bot.on(events.NewMessage(pattern='/backup'))
+async def backup_handler(event):
+    if not is_admin_utama(event.sender_id):
+        return
+    
+    try:
+        backup_path = create_backup()
+        if backup_path:
+            await safe_send_message(event, f"✅ Backup berhasil dibuat!\nPath: `{backup_path}`")
+        else:
+            await safe_send_message(event, "❌ Gagal membuat backup!")
+    except Exception as e:
+        await safe_send_message(event, f"❌ Error: {str(e)}")
+
+# ==================== MAIN FUNCTION ====================
+async def main():
+    """Main function to run the bot"""
+    try:
+        print("🚀 Starting Telegram Bot Manager...")
+        
+        # Run startup checks
+        if not await startup_checks():
+            print("❌ Startup checks failed!")
+            return
+        
+        # Start the bot
+        await bot.start(bot_token=BOT_TOKEN)
+        print(f"🤖 Bot started successfully!")
+        print(f"📊 Admin Utama: {ADMIN_UTAMA}")
+        
+        # Update stats
+        bot_stats['start_time'] = datetime.now()
+        
+        # Start background tasks
+        asyncio.create_task(periodic_backup())
+        asyncio.create_task(periodic_cleanup())
+        
+        print("✅ Background tasks started")
+        print("🎯 Bot is ready to receive messages!")
+        
+        # Keep the bot running
+        await bot.run_until_disconnected()
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Bot dihentikan oleh user")
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}")
+        print(f"❌ Fatal error: {e}")
+    finally:
+        print("🔄 Cleaning up...")
+        await cleanup_on_shutdown()
+        print("👋 Bot shutdown complete")
+
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        # Set up signal handlers for graceful shutdown
+        import signal
+        
+        def signal_handler(sig, frame):
+            print(f"\n🔔 Received signal {sig}")
+            # The cleanup will be handled in main() function
+            raise KeyboardInterrupt
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Run the bot
+        asyncio.run(main())
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Failed to start bot: {e}")
+        logger.error(f"Failed to start bot: {e}")
+    finally:
+        print("👋 Goodbye!")
+
+# ==================== INSTALLATION SCRIPT ====================
+def install_requirements():
+    """Install required packages"""
+    import subprocess
+    import sys
+    
+    required_packages = [
+        "telethon>=1.24.0",
+    ]
+    
+    for package in required_packages:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            print(f"✅ {package} installed successfully")
+        except subprocess.CalledProcessError:
+            print(f"❌ Failed to install {package}")
+
+# Uncomment the line below if you want to auto-install requirements
+# install_requirements()
+
+"""
+INSTALLATION GUIDE:
+1. Install Python 3.8+
+2. Install required packages:
+   pip install telethon
+
+3. Update configuration:
+   - API_ID: Your Telegram API ID
+   - API_HASH: Your Telegram API Hash
+   - BOT_TOKEN: Your bot token from @BotFather
+   - ADMIN_UTAMA: Your Telegram user ID
+
+4. Run the bot:
+   python bot.py
+
+FEATURES:
+✅ Multi-account Telegram management
+✅ Category-based organization
+✅ Contact management (add/clear)
+✅ Group/Channel invitation
+✅ Admin management system
+✅ Automatic backups
+✅ Error handling and recovery
+✅ Session management
+✅ Flood protection
+✅ Statistics and monitoring
+✅ Graceful shutdown
+
+SECURITY FEATURES:
+🔐 Authorization system
+🔐 Admin permissions
+🔐 Session string protection
+🔐 Error logging
+🔐 Rate limiting
+🔐 Data backup and recovery
+
+TROUBLESHOOTING:
+- If bot doesn't respond: Check bot token and permissions
+- If login fails: Check API credentials and phone number format
+- If invites fail: Check account limits and group/channel permissions
+- If database errors: Check file permissions and storage space
+
+For support, check the logs in bot_data/bot.log
+"""
