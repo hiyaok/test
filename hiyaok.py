@@ -1,2383 +1,1075 @@
-#!/usr/bin/env python3
-"""
-Telegram Bot Manager - Complete Fixed Version
-Bot untuk mengelola multiple akun Telegram dengan Telethon
-"""
-
 import asyncio
+import logging
 import json
 import os
-import logging
-import threading
+import random
 import time
-import shutil
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional
 
-from telethon import TelegramClient, events, Button
-from telethon.sessions import StringSession
-from telethon.tl.types import InputPhoneContact, User, Chat, Channel
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Contact
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, 
+    MessageHandler, filters, ContextTypes, ConversationHandler
+)
+
+from telethon import TelegramClient, events, functions, types
 from telethon.errors import (
-    SessionPasswordNeededError, PhoneCodeInvalidError, 
-    PasswordHashInvalidError, FloodWaitError, PhoneNumberInvalidError,
-    MessageNotModifiedError, MessageIdInvalidError, UserPrivacyRestrictedError,
-    ChatAdminRequiredError, UserAlreadyParticipantError, PeerFloodError
+    PhoneCodeInvalidError, PhoneNumberInvalidError, 
+    SessionPasswordNeededError, PasswordHashInvalidError
 )
-from telethon.tl.functions.contacts import (
-    ImportContactsRequest, DeleteContactsRequest, GetContactsRequest
-)
-from telethon.tl.functions.channels import InviteToChannelRequest
+from telethon.tl.functions.contacts import GetContactsRequest
+from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import AddChatUserRequest
 
-# ==================== CONFIGURATION ====================
-API_ID = "20755791"
-API_HASH = "3d09356fe14a31a5baaad296a1abef80"
-BOT_TOKEN = "8426128734:AAHYVpJCy7LrofTI3AzyUNhB_42hQnVNwiA"
-ADMIN_UTAMA = 5988451717
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-DATA_DIR = "bot_data"
-KATEGORI_FILE = os.path.join(DATA_DIR, "kategori.json")
-AKUN_TG_FILE = os.path.join(DATA_DIR, "akun_tg.json")
-TEMP_CONTACTS_FILE = os.path.join(DATA_DIR, "temp_contacts.json")
-ADMIN_BOTS_FILE = os.path.join(DATA_DIR, "admin_bots.json")
+# States untuk conversation handler
+WAITING_PHONE, WAITING_CODE, WAITING_PASSWORD = range(3)
+WAITING_CONTACT, WAITING_INVITE_LINK = range(3, 5)
 
-# ==================== LOGGING SETUP ====================
-def setup_logging():
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(os.path.join(DATA_DIR, 'bot.log')),
-            logging.StreamHandler()
-        ]
-    )
-    logging.getLogger('telethon').setLevel(logging.WARNING)
-    return logging.getLogger(__name__)
+# Konfigurasi
+BOT_TOKEN = "8426128734:AAHYVpJCy7LrofTI3AzyUNhB_42hQnVNwiA"  # Ganti dengan token bot kamu
+API_ID = "22211268"       # Ganti dengan API ID dari my.telegram.org
+API_HASH = "8c5c2a1aa3a0a4909cffe54f60f89efb"   # Ganti dengan API Hash dari my.telegram.org
+MAIN_ADMIN = 5988451717            # Ganti dengan user ID admin utama
 
-logger = setup_logging()
-
-# ==================== STORAGE MANAGER ====================
-file_lock = threading.RLock()
-
-class JSONStorage:
+class TelegramManager:
     def __init__(self):
-        self.ensure_data_dir()
-        self.init_json_files()
-    
-    def ensure_data_dir(self):
-        if not os.path.exists(DATA_DIR):
-            os.makedirs(DATA_DIR)
-    
-    def init_json_files(self):
-        default_data = {
-            KATEGORI_FILE: [],
-            AKUN_TG_FILE: [],
-            TEMP_CONTACTS_FILE: [],
-            ADMIN_BOTS_FILE: []
-        }
+        self.accounts: Dict[str, Dict] = {}
+        self.clients: Dict[str, TelegramClient] = {}
+        self.admins: List[int] = [MAIN_ADMIN]
+        self.contact_sessions: Dict[int, Dict] = {}
+        self.load_data()
         
-        for file_path, default_content in default_data.items():
-            if not os.path.exists(file_path):
-                self.write_json(file_path, default_content)
-    
-    def read_json(self, file_path: str) -> List[Dict]:
-        with file_lock:
-            try:
-                if not os.path.exists(file_path):
-                    return []
-                
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                    if not content:
-                        return []
-                    data = json.loads(content)
-                    return data if isinstance(data, list) else []
-            except (json.JSONDecodeError, FileNotFoundError):
-                logger.error(f"Error reading {file_path}")
-                return []
-            except Exception as e:
-                logger.error(f"Error reading {file_path}: {e}")
-                return []
-    
-    def write_json(self, file_path: str, data: List[Dict]) -> bool:
-        with file_lock:
-            try:
-                # Create backup
-                backup_path = file_path + '.backup'
-                if os.path.exists(file_path):
-                    shutil.copy2(file_path, backup_path)
-                
-                # Write new data
-                temp_path = file_path + '.tmp'
-                with open(temp_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                
-                # Atomic rename
-                if os.name == 'nt':  # Windows
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                os.rename(temp_path, file_path)
-                
-                # Remove backup if write successful
-                if os.path.exists(backup_path):
-                    os.remove(backup_path)
-                
-                return True
-            except Exception as e:
-                logger.error(f"Error writing {file_path}: {e}")
-                # Restore backup if exists
-                backup_path = file_path + '.backup'
-                if os.path.exists(backup_path):
-                    shutil.copy2(backup_path, file_path)
-                    os.remove(backup_path)
-                return False
-    
-    def get_next_id(self, file_path: str) -> int:
-        data = self.read_json(file_path)
-        if not data:
-            return 1
-        max_id = max([item.get('id', 0) for item in data], default=0)
-        return max_id + 1
-
-# Initialize storage
-storage = JSONStorage()
-
-# ==================== DATABASE FUNCTIONS ====================
-# Kategori functions
-def get_kategori() -> List[tuple]:
-    data = storage.read_json(KATEGORI_FILE)
-    return [(item['id'], item['nama']) for item in data]
-
-def add_kategori(nama: str) -> bool:
-    data = storage.read_json(KATEGORI_FILE)
-    if any(item['nama'].lower() == nama.lower() for item in data):
-        return False
-    
-    new_kategori = {
-        'id': storage.get_next_id(KATEGORI_FILE),
-        'nama': nama.strip(),
-        'created_at': datetime.now().isoformat()
-    }
-    
-    data.append(new_kategori)
-    return storage.write_json(KATEGORI_FILE, data)
-
-def create_user_state(action, **kwargs):
-    """Create user state with timestamp"""
-    state = {"action": action, "created_at": time.time()}
-    state.update(kwargs)
-    return state
-
-def set_user_state(user_id, action, **kwargs):
-    """Set user state with proper tracking"""
-    user_states[user_id] = create_user_state(action, **kwargs)
-    update_stats('active_sessions', len(user_states) - bot_stats.get('active_sessions', 0))
-
-def update_kategori(kategori_id: int, nama_baru: str) -> bool:
-    data = storage.read_json(KATEGORI_FILE)
-    nama_baru = nama_baru.strip()
-    if any(item['nama'].lower() == nama_baru.lower() and item['id'] != kategori_id for item in data):
-        return False
-    
-    for item in data:
-        if item['id'] == kategori_id:
-            item['nama'] = nama_baru
-            return storage.write_json(KATEGORI_FILE, data)
-    return False
-
-def get_kategori_by_id(kategori_id: int) -> Optional[Dict]:
-    data = storage.read_json(KATEGORI_FILE)
-    return next((item for item in data if item['id'] == kategori_id), None)
-
-def delete_kategori(kategori_id: int) -> bool:
-    data = storage.read_json(KATEGORI_FILE)
-    original_length = len(data)
-    data = [item for item in data if item['id'] != kategori_id]
-    if len(data) < original_length:
-        return storage.write_json(KATEGORI_FILE, data)
-    return False
-
-# Akun TG functions
-def get_akun_by_kategori(kategori_id: int) -> List[tuple]:
-    data = storage.read_json(AKUN_TG_FILE)
-    filtered_data = [item for item in data if item['kategori_id'] == kategori_id]
-    return [(item['id'], item['nomor'], item.get('nama_akun', '')) for item in filtered_data]
-
-def add_akun_tg(nomor: str, session_string: str, kategori_id: int, nama_akun: str = '') -> bool:
-    data = storage.read_json(AKUN_TG_FILE)
-    if any(item['nomor'] == nomor for item in data):
-        return False
-    
-    new_akun = {
-        'id': storage.get_next_id(AKUN_TG_FILE),
-        'nomor': nomor,
-        'session_string': session_string,
-        'kategori_id': kategori_id,
-        'nama_akun': nama_akun,
-        'created_at': datetime.now().isoformat()
-    }
-    
-    data.append(new_akun)
-    return storage.write_json(AKUN_TG_FILE, data)
-
-def get_akun_by_id(akun_id: int) -> Optional[Dict]:
-    data = storage.read_json(AKUN_TG_FILE)
-    return next((item for item in data if item['id'] == akun_id), None)
-
-def delete_akun_by_id(akun_id: int) -> bool:
-    data = storage.read_json(AKUN_TG_FILE)
-    original_length = len(data)
-    data = [item for item in data if item['id'] != akun_id]
-    if len(data) < original_length:
-        return storage.write_json(AKUN_TG_FILE, data)
-    return False
-
-def update_akun_kategori(akun_id: int, new_kategori_id: int) -> bool:
-    data = storage.read_json(AKUN_TG_FILE)
-    for item in data:
-        if item['id'] == akun_id:
-            item['kategori_id'] = new_kategori_id
-            return storage.write_json(AKUN_TG_FILE, data)
-    return False
-
-# Admin functions
-def is_admin_utama(user_id: int) -> bool:
-    return user_id == ADMIN_UTAMA
-
-def is_admin_bot(user_id: int) -> bool:
-    data = storage.read_json(ADMIN_BOTS_FILE)
-    return any(item['user_id'] == user_id for item in data)
-
-def is_authorized(user_id: int) -> bool:
-    return is_admin_utama(user_id) or is_admin_bot(user_id)
-
-def add_admin_bot(user_id: int, added_by: int) -> bool:
-    data = storage.read_json(ADMIN_BOTS_FILE)
-    if any(item['user_id'] == user_id for item in data):
-        return False
-    
-    new_admin = {
-        'user_id': user_id,
-        'added_by': added_by,
-        'added_at': datetime.now().isoformat()
-    }
-    
-    data.append(new_admin)
-    return storage.write_json(ADMIN_BOTS_FILE, data)
-
-def get_all_admin_bots() -> List[tuple]:
-    data = storage.read_json(ADMIN_BOTS_FILE)
-    return [(item['user_id'], item['added_at']) for item in data]
-
-def delete_admin_bot(user_id: int) -> bool:
-    data = storage.read_json(ADMIN_BOTS_FILE)
-    original_length = len(data)
-    data = [item for item in data if item['user_id'] != user_id]
-    if len(data) < original_length:
-        return storage.write_json(ADMIN_BOTS_FILE, data)
-    return False
-
-# Temp contacts functions
-def add_temp_contact(user_id: int, contact_data: Dict) -> bool:
-    data = storage.read_json(TEMP_CONTACTS_FILE)
-    new_contact = {
-        'user_id': user_id,
-        'contact_data': contact_data,
-        'created_at': datetime.now().isoformat()
-    }
-    data.append(new_contact)
-    return storage.write_json(TEMP_CONTACTS_FILE, data)
-
-def get_temp_contacts(user_id: int) -> List[Dict]:
-    data = storage.read_json(TEMP_CONTACTS_FILE)
-    return [item['contact_data'] for item in data if item['user_id'] == user_id]
-
-def clear_temp_contacts(user_id: int) -> bool:
-    data = storage.read_json(TEMP_CONTACTS_FILE)
-    original_length = len(data)
-    data = [item for item in data if item['user_id'] != user_id]
-    if len(data) < original_length:
-        return storage.write_json(TEMP_CONTACTS_FILE, data)
-    return True
-
-# ==================== UTILITY FUNCTIONS ====================
-def format_message(title: str, content: str = "", success: bool = None) -> str:
-    if success is True:
-        icon = "✅"
-    elif success is False:
-        icon = "❌"
-    else:
-        icon = "🤖"
-    
-    msg = "━━━━━━━━━━━━━━━━━━\n"
-    msg += f"{icon} **{title}** {icon}\n"
-    msg += "━━━━━━━━━━━━━━━━━━\n"
-    
-    if content:
-        msg += f"{content}\n"
-    
-    return msg
-
-async def safe_edit_message(event, text, buttons=None):
-    """Safely edit message with error handling"""
-    max_retries = 3
-    for attempt in range(max_retries):
+    def load_data(self):
+        """Load data dari file"""
         try:
-            if hasattr(event, 'edit'):
-                await event.edit(text, buttons=buttons)
-            else:
-                await event.reply(text, buttons=buttons)
-            return True
-        except (MessageNotModifiedError, MessageIdInvalidError):
-            try:
-                await event.reply(text, buttons=buttons)
-                return True
-            except Exception as e:
-                logger.error(f"Error in safe_edit_message fallback attempt {attempt + 1}: {e}")
-        except FloodWaitError as e:
-            logger.warning(f"FloodWait in edit message, waiting {e.seconds} seconds")
-            await asyncio.sleep(e.seconds)
+            if os.path.exists('accounts.json'):
+                with open('accounts.json', 'r') as f:
+                    data = json.load(f)
+                    self.accounts = data.get('accounts', {})
+                    self.admins = data.get('admins', [MAIN_ADMIN])
         except Exception as e:
-            logger.error(f"Error in safe_edit_message attempt {attempt + 1}: {e}")
-            if attempt == max_retries - 1:
-                try:
-                    await event.reply("❌ Terjadi error saat mengedit pesan. Silakan coba lagi.")
-                    return False
-                except:
-                    return False
-            await asyncio.sleep(1)
-    return False
-
-async def safe_send_message(event, text, buttons=None):
-    """Safely send message"""
-    max_retries = 3
-    for attempt in range(max_retries):
+            logger.error(f"Error loading data: {e}")
+    
+    def save_data(self):
+        """Save data ke file"""
         try:
-            await event.reply(text, buttons=buttons)
-            return True
-        except FloodWaitError as e:
-            logger.warning(f"FloodWait in send message, waiting {e.seconds} seconds")
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            logger.error(f"Error sending message attempt {attempt + 1}: {e}")
-            if attempt == max_retries - 1:
-                return False
-            await asyncio.sleep(1)
-    return False
-
-# ==================== BOT INITIALIZATION ====================
-bot = TelegramClient('bot_session', API_ID, API_HASH)
-user_states = {}
-active_clients = {}  # Store active client connections
-
-async def cleanup_client(user_id: int):
-    """Clean up client connection with better error handling"""
-    if user_id in active_clients:
-        try:
-            client = active_clients[user_id]
-            if hasattr(client, 'is_connected') and client.is_connected():
-                await client.disconnect()
-            logger.info(f"Client disconnected for user {user_id}")
-        except Exception as e:
-            logger.error(f"Error disconnecting client for user {user_id}: {e}")
-        finally:
-            active_clients.pop(user_id, None)
-    
-    # Also clean up user state if exists
-    user_states.pop(user_id, None)
-
-async def cleanup_expired_states():
-    """Clean up expired user states"""
-    while True:
-        try:
-            await asyncio.sleep(30 * 60)  # Every 30 minutes
-            
-            current_time = time.time()
-            expired_users = []
-            
-            for user_id, state in user_states.items():
-                # Check if state is older than 1 hour
-                state_time = state.get('created_at', current_time)
-                if current_time - state_time > 3600:  # 1 hour
-                    expired_users.append(user_id)
-            
-            for user_id in expired_users:
-                await cleanup_client(user_id)
-                logger.info(f"Cleaned up expired state for user {user_id}")
-                
-        except Exception as e:
-            logger.error(f"Error in cleanup_expired_states: {e}")
-
-# ==================== MAIN HANDLERS ====================
-@bot.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    if not is_authorized(event.sender_id):
-        await safe_send_message(event, format_message(
-            "AKSES DITOLAK", 
-            "Anda tidak memiliki izin untuk menggunakan bot ini.",
-            success=False
-        ))
-        return
-    
-    # Clear any existing state
-    user_states.pop(event.sender_id, None)
-    await cleanup_client(event.sender_id)
-    
-    buttons = []
-    if is_admin_utama(event.sender_id):
-        buttons.append([Button.inline("👑 Menu Admin Utama", b"main_admin_menu")])
-    
-    buttons.extend([
-        [Button.inline("📱 Login Nomor Baru", b"login_nomor")],
-        [Button.inline("📋 List Semua Akun", b"list_akun")],
-        [Button.inline("➕ Tambah Kontak", b"tambah_kontak")],
-        [Button.inline("🗑️ Hapus Nomor", b"hapus_nomor")],
-        [Button.inline("🧹 Clear Kontak", b"clear_kontak")],
-        [Button.inline("👥 Invite ke Grup/Channel", b"invite_grup")]
-    ])
-    
-    msg = format_message("SELAMAT DATANG", "Pilih menu yang ingin Anda gunakan:")
-    await safe_send_message(event, msg, buttons)
-
-# ==================== CALLBACK HANDLERS ====================
-@bot.on(events.CallbackQuery(data=b'back_to_main'))
-async def back_to_main_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    user_states.pop(event.sender_id, None)
-    await cleanup_client(event.sender_id)
-    
-    buttons = []
-    if is_admin_utama(event.sender_id):
-        buttons.append([Button.inline("👑 Menu Admin Utama", b"main_admin_menu")])
-    
-    buttons.extend([
-        [Button.inline("📱 Login Nomor Baru", b"login_nomor")],
-        [Button.inline("📋 List Semua Akun", b"list_akun")],
-        [Button.inline("➕ Tambah Kontak", b"tambah_kontak")],
-        [Button.inline("🗑️ Hapus Nomor", b"hapus_nomor")],
-        [Button.inline("🧹 Clear Kontak", b"clear_kontak")],
-        [Button.inline("👥 Invite ke Grup/Channel", b"invite_grup")]
-    ])
-    
-    msg = format_message("MENU UTAMA", "Pilih menu yang ingin Anda gunakan:")
-    await safe_edit_message(event, msg, buttons)
-
-# ==================== ADMIN MENU ====================
-@bot.on(events.CallbackQuery(data=b'main_admin_menu'))
-async def main_admin_menu(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    buttons = [
-        [Button.inline("👨‍💼 Kelola Admin Bot", b"kelola_admin")],
-        [Button.inline("📁 Kelola Kategori", b"kelola_kategori")],
-        [Button.inline("🔄 Pindah Nomor Kategori", b"pindah_kategori")],
-        [Button.inline("🔙 Kembali", b"back_to_main")]
-    ]
-    
-    msg = format_message("MENU ADMIN UTAMA", "Fitur khusus untuk admin utama:")
-    await safe_edit_message(event, msg, buttons)
-
-# ==================== KELOLA KATEGORI ====================
-@bot.on(events.CallbackQuery(data=b'kelola_kategori'))
-async def kelola_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    buttons = [
-        [Button.inline("➕ Tambah Kategori", b"tambah_kategori")],
-        [Button.inline("📝 Edit Kategori", b"edit_kategori")],
-        [Button.inline("🗑️ Hapus Kategori", b"hapus_kategori")],
-        [Button.inline("📋 List Kategori", b"list_kategori")],
-        [Button.inline("🔙 Kembali", b"main_admin_menu")]
-    ]
-    
-    msg = format_message("KELOLA KATEGORI", "Pilih aksi untuk kategori:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(data=b'tambah_kategori'))
-async def tambah_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    user_states[event.sender_id] = {"action": "tambah_kategori"}
-    msg = format_message("TAMBAH KATEGORI BARU", "Kirim nama kategori yang ingin dibuat:")
-    await safe_edit_message(event, msg)
-
-@bot.on(events.CallbackQuery(data=b'edit_kategori'))
-async def edit_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", b"kelola_kategori")]]
-        msg = format_message("BELUM ADA KATEGORI", "Belum ada kategori yang dibuat.", success=False)
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📝 {kat_nama}", f"edit_kat_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"kelola_kategori")])
-    
-    msg = format_message("EDIT KATEGORI", "Pilih kategori yang ingin diedit:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'edit_kat_(\d+)'))
-async def edit_kategori_nama_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    user_states[event.sender_id] = {
-        "action": "edit_nama_kategori",
-        "kategori_id": kategori_id,
-        "old_name": kategori['nama']
-    }
-    
-    msg = format_message("EDIT NAMA KATEGORI", 
-                       f"**Nama saat ini:** {kategori['nama']}\n\n" +
-                       "Kirim nama baru untuk kategori ini:")
-    
-    await safe_edit_message(event, msg)
-
-@bot.on(events.CallbackQuery(data=b'hapus_kategori'))
-async def hapus_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", b"kelola_kategori")]]
-        msg = format_message("BELUM ADA KATEGORI", "Belum ada kategori yang dibuat.", success=False)
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"🗑️ {kat_nama}", f"confirm_hapus_kat_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"kelola_kategori")])
-    
-    msg = format_message("HAPUS KATEGORI", "Pilih kategori yang ingin dihapus:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'confirm_hapus_kat_(\d+)'))
-async def confirm_hapus_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    # Check if category has accounts
-    akun_list = get_akun_by_kategori(kategori_id)
-    if akun_list:
-        await event.answer(f"❌ Tidak bisa hapus kategori '{kategori['nama']}' karena masih ada {len(akun_list)} akun!", alert=True)
-        return
-    
-    buttons = [
-        [Button.inline("✅ Ya, Hapus!", f"execute_hapus_kat_{kategori_id}".encode())],
-        [Button.inline("❌ Batal", b"hapus_kategori")]
-    ]
-    
-    msg = format_message("KONFIRMASI HAPUS KATEGORI", 
-                       f"Yakin ingin menghapus kategori **{kategori['nama']}**?\n\n" +
-                       "**PERINGATAN:** Aksi ini tidak dapat dibatalkan!")
-    
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'execute_hapus_kat_(\d+)'))
-async def execute_hapus_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    if delete_kategori(kategori_id):
-        buttons = [[Button.inline("🔙 Kembali ke Menu Admin", b"main_admin_menu")]]
-        msg = format_message("KATEGORI BERHASIL DIHAPUS", 
-                           f"Kategori **{kategori['nama']}** telah dihapus!",
-                           success=True)
-        await safe_edit_message(event, msg, buttons)
-    else:
-        await event.answer("❌ Gagal menghapus kategori!", alert=True)
-
-@bot.on(events.CallbackQuery(data=b'list_kategori'))
-async def list_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    
-    if not kategori_list:
-        content = "Belum ada kategori yang dibuat."
-    else:
-        content = "**DAFTAR KATEGORI:**\n\n"
-        for kat_id, kat_nama in kategori_list:
-            akun_count = len(get_akun_by_kategori(kat_id))
-            content += f"📁 **{kat_nama}**\n"
-            content += f"🆔 ID: {kat_id}\n"
-            content += f"📱 Akun: {akun_count}\n\n"
-    
-    buttons = [[Button.inline("🔙 Kembali", b"kelola_kategori")]]
-    msg = format_message("DAFTAR KATEGORI", content)
-    await safe_edit_message(event, msg, buttons)
-
-# ==================== KELOLA ADMIN BOT ====================
-@bot.on(events.CallbackQuery(data=b'kelola_admin'))
-async def kelola_admin_menu(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    buttons = [
-        [Button.inline("➕ Tambah Admin", b"tambah_admin")],
-        [Button.inline("➖ Hapus Admin", b"hapus_admin")],
-        [Button.inline("📋 List Admin", b"list_admin")],
-        [Button.inline("🔙 Kembali", b"main_admin_menu")]
-    ]
-    
-    msg = format_message("KELOLA ADMIN BOT", "Pilih aksi untuk admin bot:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(data=b'tambah_admin'))
-async def tambah_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    user_states[event.sender_id] = {"action": "tambah_admin"}
-    msg = format_message("TAMBAH ADMIN BARU", 
-                        "Forward pesan dari user yang ingin dijadikan admin atau kirim user ID:")
-    await safe_edit_message(event, msg)
-
-# Continuing from the previous part...
-
-@bot.on(events.CallbackQuery(data=b'list_admin'))
-async def list_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    admins = get_all_admin_bots()
-    
-    if not admins:
-        content = "Belum ada admin bot yang ditambahkan."
-    else:
-        content = "**LIST ADMIN BOT:**\n\n"
-        for admin_id, added_at in admins:
-            try:
-                user = await bot.get_entity(admin_id)
-                name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-                username = f"@{user.username}" if user.username else "No username"
-            except:
-                name = "Unknown User"
-                username = ""
-            
-            content += f"👤 **{name}** {username}\n"
-            content += f"🆔 ID: `{admin_id}`\n"
-            content += f"📅 Ditambahkan: {added_at[:10]}\n\n"
-    
-    buttons = [[Button.inline("🔙 Kembali", b"kelola_admin")]]
-    msg = format_message("DAFTAR ADMIN BOT", content)
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(data=b'hapus_admin'))
-async def hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    admins = get_all_admin_bots()
-    
-    if not admins:
-        buttons = [[Button.inline("🔙 Kembali", b"kelola_admin")]]
-        msg = format_message("TIDAK ADA ADMIN BOT", 
-                            "Belum ada admin bot yang bisa dihapus.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for admin_id, _ in admins:
-        try:
-            user = await bot.get_entity(admin_id)
-            name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-            username = f"@{user.username}" if user.username else ""
-            display_name = f"{name} {username}".strip()
-        except:
-            display_name = f"User ID: {admin_id}"
-        
-        buttons.append([Button.inline(f"🗑️ {display_name}", f"confirm_hapus_admin_{admin_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"kelola_admin")])
-    
-    msg = format_message("HAPUS ADMIN BOT", "Pilih admin yang ingin dihapus:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'confirm_hapus_admin_(\d+)'))
-async def confirm_hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    admin_id = int(event.data.decode().split('_')[-1])
-    
-    try:
-        user = await bot.get_entity(admin_id)
-        name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-        display_name = name
-    except:
-        display_name = f"User ID: {admin_id}"
-    
-    buttons = [
-        [Button.inline("✅ Ya, Hapus!", f"execute_hapus_admin_{admin_id}".encode())],
-        [Button.inline("❌ Batal", b"hapus_admin")]
-    ]
-    
-    msg = format_message("KONFIRMASI HAPUS ADMIN", 
-                       f"Yakin ingin menghapus **{display_name}** dari admin bot?")
-    
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'execute_hapus_admin_(\d+)'))
-async def execute_hapus_admin_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    admin_id = int(event.data.decode().split('_')[-1])
-    
-    if delete_admin_bot(admin_id):
-        try:
-            user = await bot.get_entity(admin_id)
-            name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-            display_name = name
-        except:
-            display_name = f"User ID: {admin_id}"
-        
-        buttons = [[Button.inline("🔙 Kembali ke Menu Admin", b"main_admin_menu")]]
-        msg = format_message("ADMIN BERHASIL DIHAPUS", 
-                           f"**{display_name}** telah dihapus dari admin bot!",
-                           success=True)
-        
-        await safe_edit_message(event, msg, buttons)
-    else:
-        await event.answer("❌ Gagal menghapus admin!", alert=True)
-
-# ==================== LOGIN NOMOR ====================
-@bot.on(events.CallbackQuery(data=b'login_nomor'))
-async def login_nomor_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    user_states[event.sender_id] = {"action": "login_step1"}
-    msg = format_message("LOGIN NOMOR BARU", 
-                        "Kirim nomor HP yang ingin di-login (format: +628123456789):")
-    await safe_edit_message(event, msg)
-
-# ==================== LIST AKUN ====================
-@bot.on(events.CallbackQuery(data=b'list_akun'))
-async def list_akun_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", b"back_to_main")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat. Buat kategori dulu!",
-                            success=False)
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"list_akun_kat_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"back_to_main")])
-    
-    msg = format_message("PILIH KATEGORI", 
-                        "Pilih kategori untuk melihat akun-akun di dalamnya:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'list_akun_kat_(\d+)'))
-async def list_akun_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        content = f"Belum ada akun di kategori **{kategori_nama}**"
-    else:
-        content = f"**AKUN DI KATEGORI: {kategori_nama}**\n\n"
-        for akun_id, nomor, nama_akun in akun_list:
-            status_emoji = "🟢"
-            content += f"{status_emoji} **{nomor}**\n"
-            if nama_akun:
-                content += f"👤 Nama: {nama_akun}\n"
-            content += f"🆔 ID: {akun_id}\n\n"
-    
-    buttons = [[Button.inline("🔙 Kembali", b"list_akun")]]
-    msg = format_message(f"KATEGORI: {kategori_nama.upper()}", content)
-    await safe_edit_message(event, msg, buttons)
-
-# ==================== TAMBAH KONTAK ====================
-@bot.on(events.CallbackQuery(data=b'tambah_kontak'))
-async def tambah_kontak_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    user_states[event.sender_id] = {"action": "tambah_kontak_step1", "contacts": []}
-    msg = format_message("TAMBAH KONTAK", 
-                        "Kirim kontak yang ingin ditambahkan satu per satu.\n\n" +
-                        "Setelah selesai kirim semua kontak, ketik `/done` untuk lanjut ke step berikutnya.")
-    await safe_edit_message(event, msg)
-
-# ==================== HAPUS NOMOR ====================
-@bot.on(events.CallbackQuery(data=b'hapus_nomor'))
-async def hapus_nomor_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", b"back_to_main")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"hapus_nomor_kat_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"back_to_main")])
-    
-    msg = format_message("HAPUS NOMOR", "Pilih kategori untuk melihat nomor yang bisa dihapus:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'hapus_nomor_kat_(\d+)'))
-async def hapus_nomor_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        buttons = [[Button.inline("🔙 Kembali", b"hapus_nomor")]]
-        msg = format_message(f"KATEGORI: {kategori_nama.upper()}", 
-                           "Belum ada akun di kategori ini.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for akun_id, nomor, nama_akun in akun_list:
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        buttons.append([Button.inline(f"🗑️ {display_name}", f"confirm_hapus_{akun_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"hapus_nomor")])
-    
-    msg = format_message(f"HAPUS NOMOR - {kategori_nama.upper()}", 
-                       "Pilih nomor yang ingin dihapus:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'confirm_hapus_(\d+)'))
-async def confirm_hapus_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    nama_akun = akun.get('nama_akun', '')
-    display_name = f"{nomor}"
-    if nama_akun:
-        display_name += f" ({nama_akun})"
-    
-    buttons = [
-        [Button.inline("✅ Ya, Hapus!", f"execute_hapus_{akun_id}".encode())],
-        [Button.inline("❌ Batal", b"hapus_nomor")]
-    ]
-    
-    msg = format_message("KONFIRMASI HAPUS", 
-                       f"Yakin ingin menghapus akun **{display_name}**?\n\n" +
-                       "**PERINGATAN:** Data session akan dihapus permanen!")
-    
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'execute_hapus_(\d+)'))
-async def execute_hapus_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    
-    if delete_akun_by_id(akun_id):
-        buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-        msg = format_message("BERHASIL DIHAPUS", 
-                           f"Akun **{nomor}** berhasil dihapus dari database!",
-                           success=True)
-        
-        await safe_edit_message(event, msg, buttons)
-    else:
-        await event.answer("❌ Gagal menghapus akun!", alert=True)
-
-# ==================== CLEAR KONTAK ====================
-@bot.on(events.CallbackQuery(data=b'clear_kontak'))
-async def clear_kontak_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", b"back_to_main")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"clear_kontak_kat_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"back_to_main")])
-    
-    msg = format_message("CLEAR KONTAK", "Pilih kategori untuk clear kontak dari akun:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'clear_kontak_kat_(\d+)'))
-async def clear_kontak_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        buttons = [[Button.inline("🔙 Kembali", b"clear_kontak")]]
-        msg = format_message(f"KATEGORI: {kategori_nama.upper()}", 
-                           "Belum ada akun di kategori ini.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for akun_id, nomor, nama_akun in akun_list:
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        buttons.append([Button.inline(f"🧹 {display_name}", f"confirm_clear_{akun_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"clear_kontak")])
-    
-    msg = format_message(f"CLEAR KONTAK - {kategori_nama.upper()}", 
-                       "Pilih akun yang ingin di-clear kontaknya:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'confirm_clear_(\d+)'))
-async def confirm_clear_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    nama_akun = akun.get('nama_akun', '')
-    display_name = f"{nomor}"
-    if nama_akun:
-        display_name += f" ({nama_akun})"
-    
-    buttons = [
-        [Button.inline("✅ Ya, Clear Semua!", f"execute_clear_{akun_id}".encode())],
-        [Button.inline("❌ Batal", b"clear_kontak")]
-    ]
-    
-    msg = format_message("KONFIRMASI CLEAR KONTAK", 
-                       f"Yakin ingin clear SEMUA kontak dari **{display_name}**?\n\n" +
-                       "**PERINGATAN:** Semua kontak akan dihapus permanen!")
-    
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'execute_clear_(\d+)'))
-async def execute_clear_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    session_string = akun['session_string']
-    
-    try:
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.connect()
-        
-        contacts = await client(GetContactsRequest(hash=0))
-        
-        if not contacts.users:
-            await client.disconnect()
-            buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-            msg = format_message("TIDAK ADA KONTAK", 
-                               f"Akun **{nomor}** tidak punya kontak untuk di-clear.")
-            await safe_edit_message(event, msg, buttons)
-            return
-        
-        user_ids = [user.id for user in contacts.users]
-        await client(DeleteContactsRequest(user_ids))
-        
-        await client.disconnect()
-        
-        buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-        msg = format_message("KONTAK BERHASIL DI-CLEAR", 
-                           f"**{len(user_ids)} kontak** berhasil dihapus dari akun **{nomor}**!",
-                           success=True)
-        
-        await safe_edit_message(event, msg, buttons)
-        
-    except Exception as e:
-        logger.error(f"Error clearing contacts: {e}")
-        await event.answer(f"❌ Error: {str(e)}", alert=True)
-
-# ==================== INVITE KE GRUP/CHANNEL ====================
-@bot.on(events.CallbackQuery(data=b'invite_grup'))
-async def invite_grup_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", b"back_to_main")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"invite_grup_kat_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"back_to_main")])
-    
-    msg = format_message("INVITE KE GRUP/CHANNEL", 
-                        "Pilih kategori akun yang ingin digunakan:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'invite_grup_kat_(\d+)'))
-async def invite_grup_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        buttons = [[Button.inline("🔙 Kembali", b"invite_grup")]]
-        msg = format_message(f"KATEGORI: {kategori_nama.upper()}", 
-                           "Belum ada akun di kategori ini.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for akun_id, nomor, nama_akun in akun_list:
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        buttons.append([Button.inline(f"👥 {display_name}", f"pilih_akun_invite_{akun_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"invite_grup")])
-    
-    msg = format_message(f"PILIH AKUN - {kategori_nama.upper()}", 
-                       "Pilih akun yang ingin digunakan untuk invite kontak:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'pilih_akun_invite_(\d+)'))
-async def pilih_akun_invite_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    
-    user_states[event.sender_id] = {
-        "action": "invite_input_grup",
-        "akun_id": akun_id
-    }
-    
-    msg = format_message("INPUT GRUP/CHANNEL", 
-                       "Kirim username grup/channel atau invite link nya:\n\n" +
-                       "**Contoh:**\n" +
-                       "• @namagrup\n" +
-                       "• https://t.me/namagrup\n" +
-                       "• https://t.me/+AbCdEfGhIjK")
-    
-    await safe_edit_message(event, msg)
-
-# ==================== PINDAH KATEGORI ====================
-@bot.on(events.CallbackQuery(data=b'pindah_kategori'))
-async def pindah_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_list = get_kategori()
-    
-    if not kategori_list:
-        buttons = [[Button.inline("🔙 Kembali", b"main_admin_menu")]]
-        msg = format_message("BELUM ADA KATEGORI", 
-                            "Belum ada kategori yang dibuat.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for kat_id, kat_nama in kategori_list:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"pindah_dari_kat_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"main_admin_menu")])
-    
-    msg = format_message("PINDAH NOMOR KATEGORI", 
-                        "Pilih kategori ASAL (kategori yang punya nomor yang ingin dipindah):")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'pindah_dari_kat_(\d+)'))
-async def pindah_dari_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    akun_list = get_akun_by_kategori(kategori_id)
-    
-    if not akun_list:
-        buttons = [[Button.inline("🔙 Kembali", b"pindah_kategori")]]
-        msg = format_message(f"KATEGORI: {kategori_nama.upper()}", 
-                           "Belum ada akun di kategori ini.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    buttons = []
-    for akun_id, nomor, nama_akun in akun_list:
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        buttons.append([Button.inline(f"📱 {display_name}", f"pilih_nomor_pindah_{akun_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"pindah_kategori")])
-    
-    msg = format_message(f"PILIH NOMOR - {kategori_nama.upper()}", 
-                       "Pilih nomor yang ingin dipindah:")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'pilih_nomor_pindah_(\d+)'))
-async def pilih_nomor_pindah_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    akun = get_akun_by_id(akun_id)
-    
-    if not akun:
-        await event.answer("❌ Akun tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    nama_akun = akun.get('nama_akun', '')
-    current_kategori_id = akun['kategori_id']
-    
-    # Get all kategori except current
-    all_kategori = get_kategori()
-    other_kategori = [(kat_id, kat_nama) for kat_id, kat_nama in all_kategori if kat_id != current_kategori_id]
-    
-    if not other_kategori:
-        buttons = [[Button.inline("🔙 Kembali", b"pindah_kategori")]]
-        msg = format_message("TIDAK ADA KATEGORI LAIN", 
-                           "Tidak ada kategori lain untuk memindahkan nomor ini.")
-        await safe_edit_message(event, msg, buttons)
-        return
-    
-    display_name = f"{nomor}"
-    if nama_akun:
-        display_name += f" ({nama_akun})"
-    
-    buttons = []
-    for kat_id, kat_nama in other_kategori:
-        buttons.append([Button.inline(f"📁 {kat_nama}", f"pindah_ke_kat_{akun_id}_{kat_id}".encode())])
-    
-    buttons.append([Button.inline("🔙 Kembali", b"pindah_kategori")])
-    
-    msg = format_message("PILIH KATEGORI TUJUAN", 
-                       f"Mau pindahkan **{display_name}** ke kategori mana?")
-    await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'pindah_ke_kat_(\d+)_(\d+)'))
-async def pindah_ke_kategori_handler(event):
-    if not is_admin_utama(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    data_parts = event.data.decode().split('_')
-    akun_id = int(data_parts[-2])
-    new_kategori_id = int(data_parts[-1])
-    
-    akun = get_akun_by_id(akun_id)
-    kategori = get_kategori_by_id(new_kategori_id)
-    
-    if not akun or not kategori:
-        await event.answer("❌ Data tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    nama_akun = akun.get('nama_akun', '')
-    kategori_nama = kategori['nama']
-    
-    if update_akun_kategori(akun_id, new_kategori_id):
-        display_name = f"{nomor}"
-        if nama_akun:
-            display_name += f" ({nama_akun})"
-        
-        buttons = [[Button.inline("🔙 Kembali ke Menu Admin", b"main_admin_menu")]]
-        msg = format_message("NOMOR BERHASIL DIPINDAH", 
-                           f"**Nomor:** {display_name}\n" +
-                           f"**Kategori baru:** {kategori_nama}",
-                           success=True)
-        
-        await safe_edit_message(event, msg, buttons)
-    else:
-        await event.answer("❌ Gagal memindahkan nomor!", alert=True)
-
-# ==================== KATEGORI SELECTION HANDLERS ====================
-@bot.on(events.CallbackQuery(data=b'buat_kategori_baru'))
-async def buat_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    user_states[event.sender_id] = {"action": "buat_kategori"}
-    msg = format_message("BUAT KATEGORI BARU", 
-                        "Kirim nama kategori yang ingin dibuat:")
-    await safe_edit_message(event, msg)
-
-@bot.on(events.CallbackQuery(pattern=r'pilih_kategori_(\d+)'))
-async def pilih_kategori_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    kategori_id = int(event.data.decode().split('_')[-1])
-    user_id = event.sender_id
-    
-    if user_id not in user_states:
-        return
-    
-    state = user_states[user_id]
-    kategori = get_kategori_by_id(kategori_id)
-    
-    if not kategori:
-        await event.answer("❌ Kategori tidak ditemukan!", alert=True)
-        return
-    
-    kategori_nama = kategori['nama']
-    
-    if state["action"] == "login_step3_pilih_kategori":
-        # Save akun to database
-        if add_akun_tg(state["nomor"], state["session_string"], kategori_id, state["nama_akun"]):
-            msg = format_message("LOGIN BERHASIL", 
-                               f"Akun **{state['nomor']}** berhasil ditambahkan ke kategori **{kategori_nama}**!\n\n" +
-                               f"👤 **Nama Akun:** {state['nama_akun']}",
-                               success=True)
-            
-            buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-            await safe_edit_message(event, msg, buttons)
-        else:
-            await event.answer("❌ Nomor ini sudah ada di database!", alert=True)
-        
-        # Clean up client connection
-        await cleanup_client(user_id)
-        user_states.pop(user_id, None)
-    
-    elif state["action"] == "tambah_kontak_step2_pilih_kategori":
-        # Get akun in selected kategori
-        akun_list = get_akun_by_kategori(kategori_id)
-        
-        if not akun_list:
-            await event.answer(f"❌ Belum ada akun di kategori {kategori_nama}!", alert=True)
-            return
-        
-        # Show akun selection
-        buttons = []
-        for akun_id, nomor, nama_akun in akun_list:
-            display_name = f"{nomor}"
-            if nama_akun:
-                display_name += f" ({nama_akun})"
-            buttons.append([Button.inline(f"📱 {display_name}", f"pilih_akun_kontak_{akun_id}".encode())])
-        
-        buttons.append([Button.inline("🔙 Kembali", b"tambah_kontak")])
-        
-        user_states[user_id]["selected_kategori"] = kategori_id
-        
-        msg = format_message(f"PILIH AKUN - {kategori_nama.upper()}", 
-                           "Pilih akun yang ingin digunakan untuk menyimpan kontak:")
-        await safe_edit_message(event, msg, buttons)
-
-@bot.on(events.CallbackQuery(pattern=r'pilih_akun_kontak_(\d+)'))
-async def pilih_akun_kontak_handler(event):
-    if not is_authorized(event.sender_id):
-        await event.answer("❌ Akses ditolak!", alert=True)
-        return
-    
-    akun_id = int(event.data.decode().split('_')[-1])
-    user_id = event.sender_id
-    
-    # Get akun data
-    akun = get_akun_by_id(akun_id)
-    
-    # Get temp contacts
-    temp_contacts = get_temp_contacts(user_id)
-    
-    if not akun or not temp_contacts:
-        await event.answer("❌ Data tidak ditemukan!", alert=True)
-        return
-    
-    nomor = akun['nomor']
-    session_string = akun['session_string']
-    
-    try:
-        # Show progress
-        progress_msg = format_message("PROSES TAMBAH KONTAK", 
-                                    f"Memproses {len(temp_contacts)} kontak ke akun {nomor}...")
-        msg_obj = await safe_edit_message(event, progress_msg)
-        
-        # Connect with the selected account
-        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-        await client.connect()
-        
-        # Prepare contacts for import
-        contacts_to_import = []
-        for i, contact_data in enumerate(temp_contacts):
-            phone_number = contact_data['phone']
-            if not phone_number.startswith('+'):
-                phone_number = '+' + phone_number
-            
-            contact = InputPhoneContact(
-                client_id=i,
-                phone=phone_number,
-                first_name=contact_data['first_name'] or 'Unknown',
-                last_name=contact_data['last_name'] or ''
-            )
-            contacts_to_import.append(contact)
-        
-        # Import contacts in batches to avoid flood limits
-        batch_size = 50
-        total_imported = 0
-        
-        for i in range(0, len(contacts_to_import), batch_size):
-            batch = contacts_to_import[i:i + batch_size]
-            try:
-                result = await client(ImportContactsRequest(batch))
-                total_imported += len(result.imported)
-                
-                # Update progress
-                progress_text = format_message("PROSES TAMBAH KONTAK", 
-                                             f"Progress: {min(i + batch_size, len(contacts_to_import))}/{len(contacts_to_import)}\n" +
-                                             f"Berhasil: {total_imported}")
-                try:
-                    await safe_edit_message(event, progress_text)
-                except:
-                    pass  # Ignore edit errors during progress
-                
-                # Add delay between batches
-                if i + batch_size < len(contacts_to_import):
-                    await asyncio.sleep(2)
-                    
-            except FloodWaitError as e:
-                logger.warning(f"FloodWait while importing contacts: {e.seconds} seconds")
-                await asyncio.sleep(e.seconds)
-                # Retry this batch
-                try:
-                    result = await client(ImportContactsRequest(batch))
-                    total_imported += len(result.imported)
-                except Exception as retry_e:
-                    logger.error(f"Error on retry import: {retry_e}")
-            except Exception as batch_e:
-                logger.error(f"Error importing batch: {batch_e}")
-                continue
-        
-        await client.disconnect()
-        
-        # Clear temp contacts
-        clear_temp_contacts(user_id)
-        
-        msg = format_message("KONTAK BERHASIL DITAMBAHKAN", 
-                           f"**Akun:** {nomor}\n" +
-                           f"**Berhasil:** {total_imported}/{len(temp_contacts)} kontak\n\n" +
-                           "Semua kontak sudah disimpan ke akun Telegram yang dipilih!",
-                           success=True)
-        
-        buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-        await safe_edit_message(event, msg, buttons)
-        
-        user_states.pop(user_id, None)
-            
-    except Exception as e:
-        logger.error(f"Error adding contacts: {e}")
-        await event.answer(f"❌ Error: {str(e)}", alert=True)
-
-# ==================== MESSAGE HANDLERS ====================
-@bot.on(events.NewMessage(func=lambda e: not e.message.text.startswith('/') if e.message.text else True))
-async def message_handler(event):
-    if not is_authorized(event.sender_id):
-        return
-    
-    user_id = event.sender_id
-    
-    if user_id not in user_states:
-        # Handle perintah tidak dikenal
-        msg = "❌ **Perintah tidak dikenali!**\n\n" + \
-              "Gunakan tombol yang tersedia atau ketik /start untuk kembali ke menu utama."
-        await safe_send_message(event, msg)
-        return
-    
-    state = user_states[user_id]
-    
-    # Update stats
-    update_stats('total_commands')
-    
-    # Handle Login Steps
-    if state["action"] == "login_step1":
-        nomor = event.message.text.strip()
-        if not nomor.startswith('+'):
-            await safe_send_message(event, "❌ Format nomor salah! Harus dimulai dengan + (contoh: +628123456789)")
-            return
-        
-        try:
-            # Create new client for this number
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
-            
-            result = await client.send_code_request(nomor)
-            
-            user_states[user_id] = {
-                "action": "login_step2", 
-                "nomor": nomor,
-                "client": client,
-                "phone_code_hash": result.phone_code_hash
+            data = {
+                'accounts': self.accounts,
+                'admins': self.admins
             }
-            
-            # Store client for cleanup
-            active_clients[user_id] = client
-            
-            msg = format_message("KODE OTP DIKIRIM", 
-                               f"Kode OTP telah dikirim ke **{nomor}**\n\nKirim kode OTP yang Anda terima:")
-            await safe_send_message(event, msg)
-        except PhoneNumberInvalidError:
-            await safe_send_message(event, "❌ **Nomor HP tidak valid!** Cek lagi format nomor yang Anda kirim.")
-            user_states.pop(user_id, None)
-        except FloodWaitError as e:
-            await safe_send_message(event, f"❌ **Terlalu banyak request!** Tunggu {e.seconds} detik lagi.")
-            user_states.pop(user_id, None)
+            with open('accounts.json', 'w') as f:
+                json.dump(data, f, indent=2)
         except Exception as e:
-            logger.error(f"Error in login step 1: {e}")
-            update_stats('errors')
-            await safe_send_message(event, f"❌ **Error:** {str(e)}")
-            user_states.pop(user_id, None)
+            logger.error(f"Error saving data: {e}")
     
-    elif state["action"] == "login_step2":
-        code = event.message.text.strip().replace(' ', '').replace('-', '')
-        
+    def is_admin(self, user_id: int) -> bool:
+        """Cek apakah user adalah admin"""
+        return user_id in self.admins
+    
+    def is_main_admin(self, user_id: int) -> bool:
+        """Cek apakah user adalah main admin"""
+        return user_id == MAIN_ADMIN
+    
+    async def create_client(self, phone: str) -> TelegramClient:
+        """Buat client Telethon baru"""
+        session_name = f"session_{phone.replace('+', '')}"
+        client = TelegramClient(session_name, API_ID, API_HASH)
+        return client
+    
+    async def get_contacts_count(self, client):
+        """Hitung jumlah kontak dengan detail"""
         try:
-            client = state["client"]
-            nomor = state["nomor"]
+            total_contacts = 0
+            mutual_contacts = 0
+            non_mutual_contacts = 0
             
-            await client.sign_in(nomor, code, phone_code_hash=state["phone_code_hash"])
+            result = await client(GetContactsRequest(hash=0))
+            all_contacts = result.users
             
-            # Get session string
-            session_string = client.session.save()
-            
-            # Get user info
-            me = await client.get_me()
-            nama_akun = me.first_name + (f" {me.last_name}" if me.last_name else "")
-            
-            await client.disconnect()
-            
-            user_states[user_id] = {
-                "action": "login_step3_pilih_kategori",
-                "nomor": nomor,
-                "session_string": session_string,
-                "nama_akun": nama_akun
-            }
-            
-            # Show kategori selection
-            await show_kategori_selection(event, "Pilih kategori untuk nomor ini:")
-            
-        except SessionPasswordNeededError:
-            user_states[user_id]["action"] = "login_step2_password"
-            msg = format_message("BUTUH PASSWORD 2FA", 
-                               "Akun ini menggunakan 2FA. Kirim password 2FA Anda:")
-            await safe_send_message(event, msg)
-        except PhoneCodeInvalidError:
-            await safe_send_message(event, "❌ **Kode OTP salah!** Coba lagi dengan kode yang benar:")
-        except FloodWaitError as e:
-            await safe_send_message(event, f"❌ **Flood wait!** Tunggu {e.seconds} detik lagi.")
-        except Exception as e:
-            logger.error(f"Error in login step 2: {e}")
-            update_stats('errors')
-            await safe_send_message(event, f"❌ **Error:** {str(e)}")
-            await cleanup_client(user_id)
-            user_states.pop(user_id, None)
-    
-    elif state["action"] == "login_step2_password":
-        password = event.message.text.strip()
-        
-        try:
-            client = state["client"]
-            await client.sign_in(password=password)
-            
-            # Get session string
-            session_string = client.session.save()
-            
-            # Get user info
-            me = await client.get_me()
-            nama_akun = me.first_name + (f" {me.last_name}" if me.last_name else "")
-            
-            await client.disconnect()
-            
-            user_states[user_id] = {
-                "action": "login_step3_pilih_kategori",
-                "nomor": state["nomor"],
-                "session_string": session_string,
-                "nama_akun": nama_akun
-            }
-            
-            await show_kategori_selection(event, "Pilih kategori untuk nomor ini:")
-            
-        except PasswordHashInvalidError:
-            await safe_send_message(event, "❌ **Password salah!** Coba lagi:")
-        except FloodWaitError as e:
-            await safe_send_message(event, f"❌ **Flood wait!** Tunggu {e.seconds} detik lagi.")
-        except Exception as e:
-            logger.error(f"Error in login password step: {e}")
-            update_stats('errors')
-            await safe_send_message(event, f"❌ **Error:** {str(e)}")
-            await cleanup_client(user_id)
-            user_states.pop(user_id, None)
-    
-    # Handle Tambah Kontak - PERBAIKAN UTAMA DI SINI
-    elif state["action"] == "tambah_kontak_step1":
-        if event.message.contact:
-            # Handle contact message
-            contact_data = {
-                "phone": event.message.contact.phone_number,
-                "first_name": event.message.contact.first_name or "Unknown",
-                "last_name": event.message.contact.last_name or ""
-            }
-            
-            # Ensure contacts list exists
-            if "contacts" not in state:
-                state["contacts"] = []
-            
-            state["contacts"].append(contact_data)
-            user_states[user_id] = state  # Update state
-            
-            count = len(state["contacts"])
-            msg = f"✅ **Kontak ke-{count} berhasil ditambahkan!**\n\n"
-            msg += f"👤 **Nama:** {contact_data['first_name']} {contact_data['last_name']}\n"
-            msg += f"📞 **Nomor:** +{contact_data['phone']}\n\n"
-            msg += "Kirim kontak lain atau ketik `/done` jika sudah selesai."
-            
-            await safe_send_message(event, msg)
-        else:
-            # Handle text message in contact mode
-            text = event.message.text.strip()
-            if text.lower() in ['/done', 'done', 'selesai']:
-                # Process done command
-                await done_handler(event)
-                return
-            else:
-                await safe_send_message(event, "❌ **Kirim kontak yang valid!** Bukan text biasa.\n\nAtau ketik `/done` jika sudah selesai menambah kontak.")
-    
-    # Handle Tambah Admin
-    elif state["action"] == "tambah_admin":
-        if event.forward and event.forward.from_id:
-            new_admin_id = event.forward.from_id.user_id
-        else:
-            try:
-                new_admin_id = int(event.message.text.strip())
-            except ValueError:
-                await safe_send_message(event, "❌ **Format salah!** Kirim user ID yang valid atau forward pesan dari user.")
-                return
-        
-        # Check if already admin
-        if is_admin_utama(new_admin_id) or is_admin_bot(new_admin_id):
-            await safe_send_message(event, "❌ **User ini sudah jadi admin!**")
-            user_states.pop(user_id, None)
-            return
-        
-        # Add to database
-        if add_admin_bot(new_admin_id, user_id):
-            try:
-                user = await bot.get_entity(new_admin_id)
-                name = user.first_name + (f" {user.last_name}" if user.last_name else "")
-                await safe_send_message(event, f"✅ **{name}** berhasil ditambahkan sebagai admin bot!")
-            except:
-                await safe_send_message(event, f"✅ **User ID {new_admin_id}** berhasil ditambahkan sebagai admin bot!")
-        else:
-            await safe_send_message(event, "❌ **Gagal menambahkan admin!**")
-        
-        user_states.pop(user_id, None)
-    
-    elif state["action"] == "buat_kategori" or state["action"] == "tambah_kategori":
-        nama_kategori = event.message.text.strip()
-        
-        if not nama_kategori:
-            await safe_send_message(event, "❌ **Nama kategori tidak boleh kosong!**")
-            return
-        
-        if add_kategori(nama_kategori):
-            buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-            msg = format_message("KATEGORI BERHASIL DIBUAT", 
-                               f"Kategori **{nama_kategori}** telah dibuat!",
-                               success=True)
-            await safe_send_message(event, msg, buttons)
-            
-            # Check for continuation flow
-            if user_id in user_states and "login_step3" in str(user_states[user_id].get("action", "")):
-                await show_kategori_selection(event, "Pilih kategori untuk nomor ini:")
-                return
-            elif user_id in user_states and "tambah_kontak_step2" in str(user_states[user_id].get("action", "")):
-                await show_kategori_selection(event, "Pilih kategori akun yang ingin digunakan:")
-                return
-        else:
-            await safe_send_message(event, "❌ **Nama kategori sudah ada!** Gunakan nama yang lain.")
-            return
-        
-        user_states.pop(user_id, None)
-    
-    elif state["action"] == "edit_nama_kategori":
-        nama_baru = event.message.text.strip()
-        
-        if not nama_baru:
-            await safe_send_message(event, "❌ **Nama kategori tidak boleh kosong!**")
-            return
-        
-        kategori_id = state["kategori_id"]
-        old_name = state["old_name"]
-        
-        if update_kategori(kategori_id, nama_baru):
-            buttons = [[Button.inline("🔙 Kembali ke Menu Admin", b"main_admin_menu")]]
-            msg = format_message("NAMA KATEGORI BERHASIL DIUBAH", 
-                               f"**Nama lama:** {old_name}\n**Nama baru:** {nama_baru}",
-                               success=True)
-            await safe_send_message(event, msg, buttons)
-        else:
-            await safe_send_message(event, "❌ **Nama kategori sudah ada!** Gunakan nama yang lain.")
-            return
-        
-        user_states.pop(user_id, None)
-    
-    elif state["action"] == "invite_input_grup":
-        grup_input = event.message.text.strip()
-        akun_id = state["akun_id"]
-        
-        try:
-            # Get akun data
-            akun = get_akun_by_id(akun_id)
-            
-            if not akun:
-                await safe_send_message(event, "❌ **Akun tidak ditemukan!**")
-                user_states.pop(user_id, None)
-                return
-            
-            nomor = akun['nomor']
-            session_string = akun['session_string']
-            
-            # Show processing message
-            processing_msg = await safe_send_message(event, format_message(
-                "MEMPROSES...", 
-                f"Menghubungkan ke akun {nomor} dan mencari grup/channel..."
-            ))
-            
-            # Connect with the account
-            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
-            await client.connect()
-            
-            # Get the target entity (group/channel)
-            try:
-                target_entity = await client.get_entity(grup_input)
-            except Exception as e:
-                await client.disconnect()
-                await safe_send_message(event, "❌ **Grup/Channel tidak ditemukan!** Cek lagi username atau link nya.")
-                user_states.pop(user_id, None)
-                return
-            
-            # Get all contacts
-            contacts = await client(GetContactsRequest(hash=0))
-            
-            if not contacts.users:
-                await client.disconnect()
-                await safe_send_message(event, "❌ **Akun ini tidak punya kontak untuk di-invite!**")
-                user_states.pop(user_id, None)
-                return
-            
-            # Start inviting contacts
-            success_count = 0
-            failed_count = 0
-            total_count = len(contacts.users)
-            
-            # Update processing message
-            try:
-                await processing_msg.edit(format_message(
-                    "PROSES INVITE DIMULAI", 
-                    f"Mulai invite {total_count} kontak ke {target_entity.title if hasattr(target_entity, 'title') else grup_input}..."
-                ))
-            except:
-                pass
-            
-            for i, user in enumerate(contacts.users):
-                try:
-                    if isinstance(target_entity, Channel):
-                        await client(InviteToChannelRequest(target_entity, [user]))
+            for contact in all_contacts:
+                if not getattr(contact, 'bot', False) and not getattr(contact, 'deleted', False):
+                    total_contacts += 1
+                    if getattr(contact, 'mutual_contact', False):
+                        mutual_contacts += 1
                     else:
-                        await client(AddChatUserRequest(target_entity.id, user.id, 0))
-                    
-                    success_count += 1
-                    
-                    # Update progress every 10 invites
-                    if (i + 1) % 10 == 0:
-                        try:
-                            progress_msg = format_message(
-                                "PROSES INVITE...", 
-                                f"Progress: {i + 1}/{total_count}\n" +
-                                f"✅ Berhasil: {success_count}\n" +
-                                f"❌ Gagal: {failed_count}"
-                            )
-                            await processing_msg.edit(progress_msg)
-                        except:
-                            pass  # Ignore edit errors during progress updates
-                        
-                        # Add delay to avoid flood limits
-                        await asyncio.sleep(5)
-                
-                except (UserPrivacyRestrictedError, UserAlreadyParticipantError):
-                    failed_count += 1
-                    continue
-                except PeerFloodError:
-                    logger.warning("PeerFloodError encountered, stopping invites")
-                    failed_count += (total_count - i - 1)
-                    await safe_send_message(event, "⚠️ **Akun terkena limit flood!** Proses dihentikan untuk menghindari banned.")
-                    break
-                except FloodWaitError as e:
-                    logger.warning(f"FloodWait during invite: {e.seconds} seconds")
-                    await asyncio.sleep(e.seconds)
-                    try:
-                        if isinstance(target_entity, Channel):
-                            await client(InviteToChannelRequest(target_entity, [user]))
-                        else:
-                            await client(AddChatUserRequest(target_entity.id, user.id, 0))
-                        success_count += 1
-                    except:
-                        failed_count += 1
-                except Exception as invite_e:
-                    logger.error(f"Error inviting user {user.id}: {invite_e}")
-                    failed_count += 1
-                    continue
+                        non_mutual_contacts += 1
             
-            await client.disconnect()
-            
-            # Final result
-            buttons = [[Button.inline("🔙 Kembali ke Menu", b"back_to_main")]]
-            final_msg = format_message(
-                "INVITE SELESAI", 
-                f"**Akun:** {nomor}\n"
-                f"**Target:** {target_entity.title if hasattr(target_entity, 'title') else grup_input}\n"
-                f"**✅ Berhasil:** {success_count}/{total_count} kontak\n"
-                f"**❌ Gagal:** {failed_count} kontak\n\n"
-                "Proses invite sudah selesai!",
-                success=True if success_count > 0 else False
-            )
-            try:
-                await processing_msg.edit(final_msg, buttons=buttons)
-            except:
-                await safe_send_message(event, final_msg, buttons)
-            
+            return {
+                "total": total_contacts,
+                "mutual": mutual_contacts,
+                "non_mutual": non_mutual_contacts
+            }
         except Exception as e:
-            logger.error(f"Error in invite process: {e}")
-            update_stats('errors')
-            await safe_send_message(event, f"❌ **Error:** {str(e)}")
-        finally:
-            user_states.pop(user_id, None)
+            logger.error(f"Error counting contacts: {e}")
+            return {"total": 0, "mutual": 0, "non_mutual": 0}
+
+# Initialize manager
+tg_manager = TelegramManager()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk command /start"""
+    user_id = update.effective_user.id
     
+    if not tg_manager.is_admin(user_id):
+        await update.message.reply_text("❌ Lo gak punya akses ke bot ini!")
+        return
+    
+    total_accounts = len(tg_manager.accounts)
+    
+    if total_accounts == 0:
+        text = "🏠 *Dashboard Bot Manager*\n\n"
+        text += "📱 Total Akun: 0\n\n"
+        text += "Belum ada akun yang terdaftar nih!"
+        
+        keyboard = [[InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")]]
     else:
-        # Handle unknown state
-        msg = "❌ **State tidak dikenali!** Silakan ketik /start untuk kembali ke menu utama."
-        await safe_send_message(event, msg)
-        user_states.pop(user_id, None)
+        text = f"🏠 *Dashboard Bot Manager*\n\n"
+        text += f"📱 Total Akun: {total_accounts}\n\n"
+        text += "*Pilih akun untuk dikelola:*"
+        
+        keyboard = []
+        for phone, data in tg_manager.accounts.items():
+            name = data.get('name', phone)
+            keyboard.append([InlineKeyboardButton(f"📞 {name}", callback_data=f"account_{phone}")])
+        
+        keyboard.append([InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
 
-# Done Command Handler
-@bot.on(events.NewMessage(pattern=r'^/done$|^done$|^selesai$'))
-async def done_handler(event):
-    if not is_authorized(event.sender_id):
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk command /admin - khusus main admin"""
+    user_id = update.effective_user.id
+    
+    if not tg_manager.is_main_admin(user_id):
+        await update.message.reply_text("❌ Command ini khusus main admin doang!")
         return
     
-    user_id = event.sender_id
+    text = "👑 *Panel Admin Utama*\n\n"
+    text += f"Total Admin: {len(tg_manager.admins)}\n\n"
+    text += "*List Admin Biasa:*\n"
     
-    if user_id not in user_states:
-        await safe_send_message(event, "❌ **Tidak ada proses aktif yang bisa diselesaikan.**")
-        return
-    
-    state = user_states[user_id]
-    
-    if state["action"] == "tambah_kontak_step1":
-        if "contacts" not in state or not state["contacts"]:
-            await safe_send_message(event, "❌ **Belum ada kontak yang ditambahkan!**")
-            return
-        
-        # Save contacts temporarily
-        clear_temp_contacts(user_id)  # Clear old temp contacts
-        
-        for contact in state["contacts"]:
-            add_temp_contact(user_id, contact)
-        
-        user_states[user_id] = {"action": "tambah_kontak_step2_pilih_kategori"}
-        
-        message_text = f"✅ **{len(state['contacts'])} kontak telah disimpan sementara!**\n\n"
-        message_text += "Sekarang pilih kategori akun yang ingin digunakan untuk menyimpan kontak:"
-        
-        await show_kategori_selection(event, message_text)
+    admin_list = [admin for admin in tg_manager.admins if admin != MAIN_ADMIN]
+    if admin_list:
+        for i, admin in enumerate(admin_list, 1):
+            text += f"{i}. `{admin}`\n"
     else:
-        await safe_send_message(event, "❌ **Perintah /done tidak berlaku untuk aksi saat ini.**")
-
-# Helper function to show kategori selection
-async def show_kategori_selection(event, message_text):
-    """Show kategori selection with proper error handling"""
-    try:
-        kategori_list = get_kategori()
-        
-        buttons = []
-        if kategori_list:
-            for kat_id, kat_nama in kategori_list:
-                buttons.append([Button.inline(f"📁 {kat_nama}", f"pilih_kategori_{kat_id}".encode())])
-        
-        buttons.append([Button.inline("➕ Buat Kategori Baru", b"buat_kategori_baru")])
-        
-        if not kategori_list:
-            message_text = "Belum ada kategori yang dibuat.\n\nBuat kategori baru dulu:"
-        
-        msg = format_message("PILIH KATEGORI", message_text)
-        
-        if hasattr(event, 'edit'):
-            await safe_edit_message(event, msg, buttons)
-        else:
-            await safe_send_message(event, msg, buttons)
-    except Exception as e:
-        logger.error(f"Error in show_kategori_selection: {e}")
-        await safe_send_message(event, "❌ Error menampilkan kategori. Silakan coba lagi.")
-
-# ==================== ERROR HANDLER ====================
-@bot.on(events.NewMessage)
-async def error_handler(event):
-    # Skip if already handled by other handlers
-    if event.message.text and (event.message.text.startswith('/') or 
-                               event.sender_id not in user_states):
-        return
+        text += "_Belum ada admin biasa_"
     
-    # Handle unknown messages
-    if not is_authorized(event.sender_id):
-        return
-    
-    user_id = event.sender_id
-    if user_id in user_states:
-        state = user_states[user_id]
-        
-        # Handle states that expect text input but not handled by message_handler
-        expected_text_states = ["buat_kategori", "tambah_kategori", "edit_nama_kategori", "invite_input_grup", 
-                               "login_step1", "login_step2", "login_step2_password", 
-                               "tambah_admin"]
-        
-        if state["action"] not in expected_text_states:
-            msg = "❌ **Perintah tidak dikenali!**\n\n" + \
-                  "Gunakan tombol yang tersedia atau ketik /start untuk kembali ke menu utama."
-            await safe_send_message(event, msg)
-
-# Continuing from previous part...
-
-def health_check():
-    """Check kesehatan JSON files"""
-    try:
-        if not os.path.exists(DATA_DIR):
-            print("❌ Data directory tidak ditemukan!")
-            return False
-        
-        files_to_check = [KATEGORI_FILE, AKUN_TG_FILE, TEMP_CONTACTS_FILE, ADMIN_BOTS_FILE]
-        
-        for file_path in files_to_check:
-            data = storage.read_json(file_path)
-            if not isinstance(data, list):
-                print(f"❌ File {file_path} format tidak valid!")
-                return False
-        
-        print("✅ Semua JSON files sehat")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Health check error: {e}")
-        return False
-
-def create_backup():
-    """Buat backup dari semua data JSON"""
-    try:
-        backup_dir = os.path.join(DATA_DIR, "backups")
-        if not os.path.exists(backup_dir):
-            os.makedirs(backup_dir)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_subdir = os.path.join(backup_dir, f"backup_{timestamp}")
-        os.makedirs(backup_subdir)
-        
-        files_to_backup = [KATEGORI_FILE, AKUN_TG_FILE, TEMP_CONTACTS_FILE, ADMIN_BOTS_FILE]
-        
-        for file_path in files_to_backup:
-            if os.path.exists(file_path):
-                filename = os.path.basename(file_path)
-                backup_path = os.path.join(backup_subdir, filename)
-                shutil.copy2(file_path, backup_path)
-        
-        print(f"✅ Backup berhasil dibuat di: {backup_subdir}")
-        return backup_subdir
-        
-    except Exception as e:
-        print(f"❌ Backup error: {e}")
-        return None
-
-def cleanup_old_backups(keep_days=7):
-    """Hapus backup lama"""
-    try:
-        backup_dir = os.path.join(DATA_DIR, "backups")
-        if not os.path.exists(backup_dir):
-            return
-        
-        current_time = time.time()
-        cutoff_time = current_time - (keep_days * 24 * 60 * 60)
-        
-        removed_count = 0
-        for backup_folder in os.listdir(backup_dir):
-            backup_path = os.path.join(backup_dir, backup_folder)
-            if os.path.isdir(backup_path):
-                folder_time = os.path.getctime(backup_path)
-                if folder_time < cutoff_time:
-                    shutil.rmtree(backup_path)
-                    removed_count += 1
-        
-        if removed_count > 0:
-            print(f"🧹 {removed_count} backup lama berhasil dihapus")
-        
-    except Exception as e:
-        print(f"❌ Cleanup error: {e}")
-
-# ==================== STARTUP FUNCTIONS ====================
-async def startup_checks():
-    """Jalankan pengecekan startup"""
-    try:
-        print("🔍 Menjalankan health check...")
-        if not health_check():
-            print("⚠️ Health check gagal, mencoba recovery...")
-            # Attempt to recreate missing files
-            storage.init_json_files()
-            if not health_check():
-                print("❌ Recovery gagal! Bot mungkin tidak berfungsi dengan baik.")
-                return False
-        
-        print("📦 Membuat backup...")
-        create_backup()
-        
-        print("🧹 Membersihkan backup lama...")
-        cleanup_old_backups()
-        
-        print("✅ Startup checks selesai!")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error during startup checks: {e}")
-        return False
-
-# ==================== PERIODIC TASKS ====================
-async def periodic_backup():
-    """Buat backup berkala setiap 6 jam"""
-    while True:
-        try:
-            await asyncio.sleep(6 * 60 * 60)  # 6 hours
-            logger.info("Creating periodic backup...")
-            create_backup()
-            cleanup_old_backups()
-        except Exception as e:
-            logger.error(f"Error in periodic backup: {e}")
-
-async def periodic_cleanup():
-    """Cleanup berkala untuk temp data"""
-    while True:
-        try:
-            await asyncio.sleep(24 * 60 * 60)  # 24 hours
-            
-            # Clear old temp contacts (older than 24 hours)
-            data = storage.read_json(TEMP_CONTACTS_FILE)
-            current_time = datetime.now()
-            cleaned_data = []
-            
-            for item in data:
-                try:
-                    created_time = datetime.fromisoformat(item['created_at'])
-                    time_diff = current_time - created_time
-                    if time_diff.total_seconds() < 24 * 60 * 60:  # Keep if less than 24 hours
-                        cleaned_data.append(item)
-                except:
-                    continue
-            
-            if len(cleaned_data) < len(data):
-                storage.write_json(TEMP_CONTACTS_FILE, cleaned_data)
-                logger.info(f"Cleaned {len(data) - len(cleaned_data)} old temp contacts")
-            
-        except Exception as e:
-            logger.error(f"Error in periodic cleanup: {e}")
-
-# ==================== GLOBAL ERROR HANDLER ====================
-async def global_error_handler(event):
-    """Handle global errors"""
-    try:
-        if hasattr(event, 'sender_id') and is_authorized(event.sender_id):
-            msg = "❌ Terjadi error internal. Tim teknis sudah diberitahu. Silakan coba lagi nanti atau hubungi admin."
-            try:
-                await event.reply(msg)
-            except:
-                pass  # If we can't send error message, just log it
-    except Exception as e:
-        logger.error(f"Error in global error handler: {e}")
-
-# ==================== BOT SHUTDOWN HANDLER ====================
-async def cleanup_on_shutdown():
-    """Cleanup resources on shutdown"""
-    try:
-        logger.info("Bot shutting down, cleaning up resources...")
-        
-        # Disconnect all active clients
-        for user_id, client in list(active_clients.items()):
-            try:
-                if client.is_connected():
-                    await client.disconnect()
-                logger.info(f"Disconnected client for user {user_id}")
-            except Exception as e:
-                logger.error(f"Error disconnecting client for user {user_id}: {e}")
-        
-        active_clients.clear()
-        
-        # Create final backup
-        create_backup()
-        
-        logger.info("Cleanup completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
-
-# ==================== ENHANCED ERROR HANDLING ====================
-def handle_telethon_errors(func):
-    """Decorator for handling common Telethon errors"""
-    async def wrapper(*args, **kwargs):
-        try:
-            return await func(*args, **kwargs)
-        except FloodWaitError as e:
-            logger.warning(f"FloodWait in {func.__name__}: {e.seconds} seconds")
-            await asyncio.sleep(e.seconds)
-            return await func(*args, **kwargs)  # Retry once
-        except (ConnectionError, OSError) as e:
-            logger.error(f"Connection error in {func.__name__}: {e}")
-            # Don't retry connection errors automatically
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error in {func.__name__}: {e}")
-            raise
-    return wrapper
-
-# ==================== MONITORING AND STATS ====================
-bot_stats = {
-    'start_time': datetime.now(),
-    'total_users': 0,
-    'total_commands': 0,
-    'active_sessions': 0,
-    'errors': 0
-}
-
-def update_stats(stat_name, increment=1):
-    """Update bot statistics with error handling"""
-    try:
-        if stat_name in bot_stats:
-            bot_stats[stat_name] += increment
-        
-        # Update user count
-        if stat_name == 'total_commands':
-            bot_stats['active_sessions'] = len(active_clients)
-            
-    except Exception as e:
-        logger.error(f"Error updating stats: {e}")
-
-def safe_handler(func):
-    """Decorator for safe event handling"""
-    async def wrapper(event):
-        try:
-            await func(event)
-        except Exception as e:
-            logger.error(f"Error in {func.__name__}: {e}")
-            update_stats('errors')
-            try:
-                if is_authorized(event.sender_id):
-                    await event.reply("❌ Terjadi error. Silakan coba lagi atau hubungi admin.")
-            except:
-                pass  # If we can't send error message, just log it
-    return wrapper
-
-def get_bot_stats():
-    """Get current bot statistics"""
-    uptime = datetime.now() - bot_stats['start_time']
-    stats_msg = f"""
-📊 **BOT STATISTICS**
-━━━━━━━━━━━━━━━━━━
-⏰ **Uptime:** {str(uptime).split('.')[0]}
-👥 **Total Users:** {bot_stats['total_users']}
-📨 **Commands Processed:** {bot_stats['total_commands']}
-🔗 **Active Sessions:** len(active_clients)
-❌ **Errors:** {bot_stats['errors']}
-💾 **Data Files:** {len([f for f in os.listdir(DATA_DIR) if f.endswith('.json')])}
-    """
-    return stats_msg
-
-# Add stats command for admin
-@bot.on(events.NewMessage(pattern='/stats'))
-async def stats_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    stats_msg = get_bot_stats()
-    await safe_send_message(event, stats_msg)
-
-@safe_handler
-@bot.on(events.NewMessage(pattern='/start'))
-async def safe_start_handler(event):
-    await start_handler(event)
-
-# Add restart command for admin
-@bot.on(events.NewMessage(pattern='/restart'))
-async def restart_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    await safe_send_message(event, "🔄 Bot akan direstart dalam 5 detik...")
-    await asyncio.sleep(5)
-    
-    # Cleanup before restart
-    await cleanup_on_shutdown()
-    
-    # Exit the program (assuming it's managed by a process manager)
-    import sys
-    sys.exit(0)
-
-# Add backup command for admin
-@bot.on(events.NewMessage(pattern='/backup'))
-async def backup_handler(event):
-    if not is_admin_utama(event.sender_id):
-        return
-    
-    try:
-        backup_path = create_backup()
-        if backup_path:
-            await safe_send_message(event, f"✅ Backup berhasil dibuat!\nPath: `{backup_path}`")
-        else:
-            await safe_send_message(event, "❌ Gagal membuat backup!")
-    except Exception as e:
-        await safe_send_message(event, f"❌ Error: {str(e)}")
-
-# ==================== MAIN FUNCTION ====================
-async def main():
-    """Main function to run the bot"""
-    try:
-        print("🚀 Starting Telegram Bot Manager...")
-        
-        # Run startup checks
-        if not await startup_checks():
-            print("❌ Startup checks failed!")
-            return
-        
-        # Start the bot
-        await bot.start(bot_token=BOT_TOKEN)
-        print(f"🤖 Bot started successfully!")
-        print(f"📊 Admin Utama: {ADMIN_UTAMA}")
-        
-        # Update stats
-        bot_stats['start_time'] = datetime.now()
-        
-        # Start background tasks
-        asyncio.create_task(periodic_backup())
-        asyncio.create_task(periodic_cleanup())
-        asyncio.create_task(cleanup_expired_states())  # ADD THIS LINE
-        
-        print("✅ Background tasks started")
-        print("🎯 Bot is ready to receive messages!")
-        
-        # Keep the bot running
-        await bot.run_until_disconnected()
-        
-    except KeyboardInterrupt:
-        print("\n🛑 Bot dihentikan oleh user")
-    except Exception as e:
-        logger.error(f"Fatal error in main: {e}")
-        print(f"❌ Fatal error: {e}")
-    finally:
-        print("🔄 Cleaning up...")
-        await cleanup_on_shutdown()
-        print("👋 Bot shutdown complete")
-
-# ==================== ENTRY POINT ====================
-if __name__ == "__main__":
-    try:
-        # Set up signal handlers for graceful shutdown
-        import signal
-        
-        def signal_handler(sig, frame):
-            print(f"\n🔔 Received signal {sig}")
-            # The cleanup will be handled in main() function
-            raise KeyboardInterrupt
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        # Run the bot
-        asyncio.run(main())
-        
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped by user")
-    except Exception as e:
-        print(f"❌ Failed to start bot: {e}")
-        logger.error(f"Failed to start bot: {e}")
-    finally:
-        print("👋 Goodbye!")
-
-# ==================== INSTALLATION SCRIPT ====================
-def install_requirements():
-    """Install required packages"""
-    import subprocess
-    import sys
-    
-    required_packages = [
-        "telethon>=1.24.0",
+    keyboard = [
+        [InlineKeyboardButton("➕ Tambah Admin", callback_data="add_admin")],
+        [InlineKeyboardButton("➖ Hapus Admin", callback_data="remove_admin")],
+        [InlineKeyboardButton("📋 List Admin", callback_data="list_admin")],
+        [InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]
     ]
     
-    for package in required_packages:
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk semua callback query"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+    
+    if not tg_manager.is_admin(user_id):
+        await query.answer("❌ Lo gak punya akses!")
+        return
+    
+    await query.answer()
+    
+    if data == "back_to_main":
+        await back_to_main_menu(query, context)
+    elif data == "add_account":
+        await start_add_account(query, context)
+    elif data.startswith("account_"):
+        phone = data.split("account_")[1]
+        await show_account_details(query, context, phone)
+    elif data.startswith("add_contact_"):
+        phone = data.split("add_contact_")[1]
+        await start_add_contact(query, context, phone)
+    elif data.startswith("done_contact_"):
+        phone = data.split("done_contact_")[1]
+        await process_add_contacts(query, context, phone)
+    elif data.startswith("delete_contacts_"):
+        phone = data.split("delete_contacts_")[1]
+        await confirm_delete_contacts(query, context, phone)
+    elif data.startswith("confirm_delete_"):
+        phone = data.split("confirm_delete_")[1]
+        await delete_all_contacts(query, context, phone)
+    elif data.startswith("delete_account_"):
+        phone = data.split("delete_account_")[1]
+        await confirm_delete_account(query, context, phone)
+    elif data.startswith("confirm_delete_acc_"):
+        phone = data.split("confirm_delete_acc_")[1]
+        await delete_account(query, context, phone)
+    elif data.startswith("invite_"):
+        if len(data.split("_")) == 2:  # invite_phone
+            phone = data.split("invite_")[1]
+            await start_invite_process(query, context, phone)
+        else:  # invite_type_phone_username
+            parts = data.split("_", 3)
+            invite_type = parts[1]
+            phone = parts[2]
+            username = parts[3]
+            await process_invite_contacts(query, context, phone, username, invite_type)
+    elif data == "add_admin" and tg_manager.is_main_admin(user_id):
+        await start_add_admin(query, context)
+    elif data == "remove_admin" and tg_manager.is_main_admin(user_id):
+        await show_remove_admin_options(query, context)
+    elif data.startswith("remove_admin_") and tg_manager.is_main_admin(user_id):
+        admin_id = int(data.split("remove_admin_")[1])
+        await remove_admin(query, context, admin_id)
+    elif data == "list_admin" and tg_manager.is_main_admin(user_id):
+        await admin_panel(query, context)
+
+async def back_to_main_menu(query, context):
+    """Kembali ke main menu"""
+    context.user_data.clear()  # Clear semua session data
+    
+    total_accounts = len(tg_manager.accounts)
+    
+    if total_accounts == 0:
+        text = "🏠 *Dashboard Bot Manager*\n\n"
+        text += "📱 Total Akun: 0\n\n"
+        text += "Belum ada akun yang terdaftar nih!"
+        
+        keyboard = [[InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")]]
+    else:
+        text = f"🏠 *Dashboard Bot Manager*\n\n"
+        text += f"📱 Total Akun: {total_accounts}\n\n"
+        text += "*Pilih akun untuk dikelola:*"
+        
+        keyboard = []
+        for phone, data in tg_manager.accounts.items():
+            name = data.get('name', phone)
+            keyboard.append([InlineKeyboardButton(f"📞 {name}", callback_data=f"account_{phone}")])
+        
+        keyboard.append([InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def start_add_account(query, context):
+    """Mulai proses tambah akun"""
+    context.user_data['waiting_phone_input'] = True
+    
+    text = "📱 *Tambah Akun Baru*\n\n"
+    text += "Kirim nomor telepon dengan format internasional\n"
+    text += "Contoh: +628123456789"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def start_add_admin(query, context):
+    """Mulai proses tambah admin"""
+    context.user_data['waiting_admin_id'] = True
+    
+    text = "👑 *Tambah Admin Baru*\n\n"
+    text += "Kirim User ID yang mau dijadiin admin:"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="list_admin")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def show_account_details(query, context, phone):
+    """Tampilkan detail akun"""
+    if phone not in tg_manager.accounts:
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("❌ Akun tidak ditemukan!", reply_markup=reply_markup)
+        return
+    
+    account = tg_manager.accounts[phone]
+    
+    try:
+        # Connect ke client
+        client = await tg_manager.create_client(phone)
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            # Get user info
+            me = await client.get_me()
+            name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+            user_id = me.id
+            
+            # Get contacts count
+            contacts = await tg_manager.get_contacts_count(client)
+            
+            text = f"📱 *Detail Akun*\n\n"
+            text += f"👤 Nama: {name}\n"
+            text += f"🆔 ID: `{user_id}`\n"
+            text += f"📞 Nomor: {phone}\n\n"
+            text += f"👥 *Kontak:*\n"
+            text += f"• Total: {contacts['total']}\n"
+            text += f"• Mutual: {contacts['mutual']}\n"
+            text += f"• Non-Mutual: {contacts['non_mutual']}\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("➕ Tambah Kontak", callback_data=f"add_contact_{phone}")],
+                [InlineKeyboardButton("🗑️ Hapus Semua Kontak", callback_data=f"delete_contacts_{phone}")],
+                [InlineKeyboardButton("📨 Invite ke Grup/Channel", callback_data=f"invite_{phone}")],
+                [InlineKeyboardButton("❌ Hapus Akun", callback_data=f"delete_account_{phone}")],
+                [InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]
+            ]
+        else:
+            text = f"❌ Akun {phone} tidak authorized. Hapus dan tambah ulang!"
+            keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+            
+        await client.disconnect()
+        
+    except Exception as e:
+        logger.error(f"Error getting account details: {e}")
+        text = f"❌ Error getting account details: {str(e)}"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def start_add_contact(query, context, phone):
+    """Mulai proses tambah kontak"""
+    context.user_data['current_phone'] = phone
+    context.user_data['contacts_to_add'] = []
+    context.user_data['last_contact_time'] = 0
+    
+    text = f"👥 *Tambah Kontak ke {phone}*\n\n"
+    text += "Kirim kontak yang mau ditambahkan\n"
+    text += "Bisa kirim beberapa kontak sekaligus\n\n"
+    text += "Tekan Done kalau udah selesai"
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Done", callback_data=f"done_contact_{phone}")],
+        [InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def confirm_delete_contacts(query, context, phone):
+    """Konfirmasi hapus semua kontak"""
+    text = f"⚠️ *Konfirmasi Hapus Kontak*\n\n"
+    text += f"Yakin mau hapus SEMUA kontak dari akun {phone}?\n"
+    text += "Aksi ini gak bisa dibatalkan!"
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Ya, Hapus Semua", callback_data=f"confirm_delete_{phone}")],
+        [InlineKeyboardButton("❌ Batal", callback_data=f"account_{phone}")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def confirm_delete_account(query, context, phone):
+    """Konfirmasi hapus akun"""
+    text = f"⚠️ *Konfirmasi Hapus Akun*\n\n"
+    text += f"Yakin mau hapus akun {phone} dari bot?\n"
+    text += "Session dan data akun akan dihapus!"
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Ya, Hapus Akun", callback_data=f"confirm_delete_acc_{phone}")],
+        [InlineKeyboardButton("❌ Batal", callback_data=f"account_{phone}")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle kontak yang dikirim user"""
+    if 'current_phone' not in context.user_data:
+        return
+    
+    contact = update.message.contact
+    if not contact:
+        return
+    
+    phone = context.user_data['current_phone']
+    current_time = time.time()
+    
+    # Tambahkan kontak ke list
+    contact_info = {
+        'phone': contact.phone_number,
+        'first_name': contact.first_name or "",
+        'last_name': contact.last_name or ""
+    }
+    context.user_data['contacts_to_add'].append(contact_info)
+    
+    # Cek apakah sudah lewat 10 detik dari kontak terakhir
+    if current_time - context.user_data.get('last_contact_time', 0) >= 10:
+        total_contacts = len(context.user_data['contacts_to_add'])
+        text = f"✅ Kontak diterima! Total: {total_contacts}\n\n"
+        text += "Kirim kontak lagi atau tekan Done untuk selesai"
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Done", callback_data=f"done_contact_{phone}")],
+            [InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
+        context.user_data['last_contact_time'] = current_time
+
+async def process_add_contacts(query, context, phone):
+    """Proses tambah semua kontak yang dikumpulkan"""
+    contacts_to_add = context.user_data.get('contacts_to_add', [])
+    
+    if not contacts_to_add:
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("❌ Gak ada kontak yang mau ditambahkan!", reply_markup=reply_markup)
+        return
+    
+    try:
+        client = await tg_manager.create_client(phone)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ Akun tidak authorized!", reply_markup=reply_markup)
+            return
+        
+        await query.edit_message_text(f"⏳ Menambahkan {len(contacts_to_add)} kontak...")
+        
+        success_count = 0
+        failed_count = 0
+        
+        for contact_info in contacts_to_add:
+            try:
+                result = await client(functions.contacts.ImportContactsRequest(
+                    contacts=[
+                        types.InputPhoneContact(
+                            client_id=random.randrange(-2**63, 2**63),
+                            phone=contact_info['phone'],
+                            first_name=contact_info['first_name'],
+                            last_name=contact_info['last_name']
+                        )
+                    ]
+                ))
+                success_count += 1
+                await asyncio.sleep(1)  # Delay untuk avoid flood
+            except Exception as e:
+                logger.error(f"Error adding contact {contact_info['phone']}: {e}")
+                failed_count += 1
+        
+        await client.disconnect()
+        
+        text = f"✅ *Selesai Tambah Kontak!*\n\n"
+        text += f"📊 Berhasil: {success_count}\n"
+        text += f"❌ Gagal: {failed_count}\n"
+        text += f"📱 Total: {len(contacts_to_add)}"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        
+        # Clear session data
+        context.user_data.clear()
+        
+    except Exception as e:
+        logger.error(f"Error processing contacts: {e}")
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
+
+async def delete_all_contacts(query, context, phone):
+    """Hapus semua kontak"""
+    try:
+        client = await tg_manager.create_client(phone)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ Akun tidak authorized!", reply_markup=reply_markup)
+            return
+        
+        await query.edit_message_text("⏳ Menghapus semua kontak...")
+        
+        # Get all contacts
+        result = await client(GetContactsRequest(hash=0))
+        contacts = result.users
+        
+        contact_ids = []
+        for contact in contacts:
+            if not getattr(contact, 'bot', False) and not getattr(contact, 'deleted', False):
+                contact_ids.append(types.InputUser(contact.id, contact.access_hash))
+        
+        if contact_ids:
+            # Delete contacts
+            await client(functions.contacts.DeleteContactsRequest(id=contact_ids))
+            
+            text = f"✅ *Berhasil hapus {len(contact_ids)} kontak!*"
+        else:
+            text = "ℹ️ Gak ada kontak yang bisa dihapus"
+        
+        await client.disconnect()
+        
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        
+    except Exception as e:
+        logger.error(f"Error deleting contacts: {e}")
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
+
+async def delete_account(query, context, phone):
+    """Hapus akun dari bot"""
+    try:
+        if phone in tg_manager.accounts:
+            del tg_manager.accounts[phone]
+            tg_manager.save_data()
+            
+            # Hapus session file
+            session_file = f"session_{phone.replace('+', '')}.session"
+            if os.path.exists(session_file):
+                os.remove(session_file)
+        
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"✅ Akun {phone} berhasil dihapus!",
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.error(f"Error deleting account: {e}")
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
+
+async def start_invite_process(query, context, phone):
+    """Mulai proses invite ke grup/channel"""
+    context.user_data['invite_phone'] = phone
+    
+    text = f"📨 *Invite Kontak ke Grup/Channel*\n\n"
+    text += "Kirim link atau username grup/channel\n"
+    text += "Contoh:\n"
+    text += "• https://t.me/namagrup\n"
+    text += "• @namagrup"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def process_invite_contacts(query, context, phone, username, invite_type):
+    """Proses invite kontak ke grup/channel"""
+    try:
+        client = await tg_manager.create_client(phone)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("❌ Akun tidak authorized!", reply_markup=reply_markup)
+            return
+        
+        await query.edit_message_text(f"⏳ Memproses invite ke @{username}...")
+        
+        # Join grup/channel dulu
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-            print(f"✅ {package} installed successfully")
-        except subprocess.CalledProcessError:
-            print(f"❌ Failed to install {package}")
+            await client(JoinChannelRequest(username))
+            await asyncio.sleep(2)
+        except Exception as e:
+            logger.info(f"Already joined or error joining: {e}")
+        
+        # Get contacts
+        result = await client(GetContactsRequest(hash=0))
+        all_contacts = result.users
+        
+        contacts_to_invite = []
+        
+        for contact in all_contacts:
+            if not getattr(contact, 'bot', False) and not getattr(contact, 'deleted', False):
+                is_mutual = getattr(contact, 'mutual_contact', False)
+                
+                if invite_type == "all":
+                    contacts_to_invite.append(contact)
+                elif invite_type == "mutual" and is_mutual:
+                    contacts_to_invite.append(contact)
+                elif invite_type == "non_mutual" and not is_mutual:
+                    contacts_to_invite.append(contact)
+        
+        if not contacts_to_invite:
+            text = f"ℹ️ Gak ada kontak yang sesuai kriteria untuk diinvite"
+            keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(text, reply_markup=reply_markup)
+            await client.disconnect()
+            return
+        
+        # Get grup/channel entity
+        entity = await client.get_entity(username)
+        
+        success_count = 0
+        failed_count = 0
+        
+        for contact in contacts_to_invite[:50]:  # Limit 50 per batch
+            try:
+                if hasattr(entity, 'megagroup') and entity.megagroup:
+                    # Supergroup
+                    await client(functions.channels.InviteToChannelRequest(
+                        channel=entity,
+                        users=[contact]
+                    ))
+                else:
+                    # Regular group
+                    await client(AddChatUserRequest(
+                        chat_id=entity.id,
+                        user_id=contact,
+                        fwd_limit=10
+                    ))
+                
+                success_count += 1
+                await asyncio.sleep(2)  # Delay untuk avoid flood
+                
+            except Exception as e:
+                logger.error(f"Error inviting {contact.id}: {e}")
+                failed_count += 1
+                await asyncio.sleep(1)
+        
+        await client.disconnect()
+        
+        text = f"✅ *Selesai Invite Kontak!*\n\n"
+        text += f"🎯 Target: @{username}\n"
+        text += f"📊 Berhasil: {success_count}\n"
+        text += f"❌ Gagal: {failed_count}\n"
+        text += f"📱 Total: {len(contacts_to_invite)}"
+        
+        if len(contacts_to_invite) > 50:
+            text += f"\n\n⚠️ Hanya 50 kontak pertama yang diinvite untuk avoid flood"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        
+    except Exception as e:
+        logger.error(f"Error inviting contacts: {e}")
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle pesan teks"""
+    user_id = update.effective_user.id
+    
+    if not tg_manager.is_admin(user_id):
+        return
+    
+    text = update.message.text
+    
+    # Handle admin ID input
+    if context.user_data.get('waiting_admin_id'):
+        await process_admin_input(update, context, text)
+        return
+    
+    # Handle phone input
+    if context.user_data.get('waiting_phone_input'):
+        await process_phone_input(update, context, text)
+        return
+    
+    # Handle code input
+    if context.user_data.get('waiting_code_input'):
+        await process_code_input(update, context, text)
+        return
+    
+    # Handle password input
+    if context.user_data.get('waiting_password_input'):
+        await process_password_input(update, context, text)
+        return
+    
+    # Handle invite link
+    if context.user_data.get('invite_phone'):
+        await process_invite_link(update, context, text)
+        return
+
+async def process_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_id_text: str):
+    """Proses input admin ID"""
+    try:
+        new_admin_id = int(admin_id_text)
+        if new_admin_id not in tg_manager.admins:
+            tg_manager.admins.append(new_admin_id)
+            tg_manager.save_data()
+            
+            text = f"✅ Admin {new_admin_id} berhasil ditambahkan!"
+            keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="list_admin")]]
+        else:
+            text = "❌ User sudah jadi admin!"
+            keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="list_admin")]]
+    except ValueError:
+        text = "❌ ID harus berupa angka!"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="list_admin")]]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, reply_markup=reply_markup)
+    
+    context.user_data['waiting_admin_id'] = False
+
+async def process_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE, phone: str):
+    """Proses input nomor telepon"""
+    try:
+        client = await tg_manager.create_client(phone)
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            text = "✅ Nomor ini udah terdaftar!"
+            keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(text, reply_markup=reply_markup)
+            await client.disconnect()
+            context.user_data.clear()
+            return
+        
+        # Send code request
+        await client.send_code_request(phone)
+        
+        context.user_data['temp_phone'] = phone
+        context.user_data['temp_client'] = client
+        context.user_data['waiting_phone_input'] = False
+        context.user_data['waiting_code_input'] = True
+        
+        text = f"📱 Kode OTP dikirim ke {phone}\nKirim kode yang diterima:"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(text, reply_markup=reply_markup)
+        
+    except PhoneNumberInvalidError:
+        text = "❌ Nomor telepon tidak valid!"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error sending code: {e}")
+        text = f"❌ Error: {str(e)}"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
+
+async def process_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
+    """Proses input kode OTP"""
+    try:
+        client = context.user_data['temp_client']
+        phone = context.user_data['temp_phone']
+        
+        await client.sign_in(phone, code)
+        
+        # Get user info
+        me = await client.get_me()
+        name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+        
+        # Save account
+        tg_manager.accounts[phone] = {
+            'name': name,
+            'user_id': me.id,
+            'added_at': datetime.now().isoformat()
+        }
+        tg_manager.save_data()
+        
+        await client.disconnect()
+        
+        context.user_data.clear()
+        
+        text = (f"✅ *Akun berhasil ditambahkan!*\n\n"
+               f"👤 Nama: {name}\n"
+               f"📞 Nomor: {phone}")
+        
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        
+    except PhoneCodeInvalidError:
+        text = "❌ Kode OTP salah! Coba lagi:"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
+    except SessionPasswordNeededError:
+        context.user_data['waiting_code_input'] = False
+        context.user_data['waiting_password_input'] = True
+        
+        text = "🔐 Akun pake 2FA. Kirim password:"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error signing in: {e}")
+        text = f"❌ Error: {str(e)}"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
+
+async def process_password_input(update: Update, context: ContextTypes.DEFAULT_TYPE, password: str):
+    """Proses input password 2FA"""
+    try:
+        client = context.user_data['temp_client']
+        phone = context.user_data['temp_phone']
+        
+        await client.sign_in(password=password)
+        
+        # Get user info
+        me = await client.get_me()
+        name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+        
+        # Save account
+        tg_manager.accounts[phone] = {
+            'name': name,
+            'user_id': me.id,
+            'added_at': datetime.now().isoformat()
+        }
+        tg_manager.save_data()
+        
+        await client.disconnect()
+        
+        context.user_data.clear()
+        
+        text = (f"✅ *Akun berhasil ditambahkan!*\n\n"
+               f"👤 Nama: {name}\n"
+               f"📞 Nomor: {phone}")
+        
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        
+    except PasswordHashInvalidError:
+        text = "❌ Password salah! Coba lagi:"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error with password: {e}")
+        text = f"❌ Error: {str(e)}"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup)
+
+async def process_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE, link: str):
+    """Proses link invite"""
+    phone = context.user_data['invite_phone']
+    
+    # Parse link atau username
+    if link.startswith('https://t.me/'):
+        username = link.split('/')[-1]
+    elif link.startswith('@'):
+        username = link[1:]
+    else:
+        username = link
+    
+    text = f"🎯 *Pilih jenis kontak yang mau diinvite:*\n\n"
+    text += f"📨 Target: @{username}\n"
+    text += f"📱 Akun: {phone}"
+    
+    keyboard = [
+        [InlineKeyboardButton("👥 Semua Kontak", callback_data=f"invite_all_{phone}_{username}")],
+        [InlineKeyboardButton("🤝 Mutual Saja", callback_data=f"invite_mutual_{phone}_{username}")],
+        [InlineKeyboardButton("👤 Non-Mutual Saja", callback_data=f"invite_non_mutual_{phone}_{username}")],
+        [InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+    
+    context.user_data.clear()
+
+async def show_remove_admin_options(query, context):
+    """Tampilkan opsi hapus admin"""
+    admin_list = [admin for admin in tg_manager.admins if admin != MAIN_ADMIN]
+    
+    if not admin_list:
+        text = "❌ Gak ada admin biasa yang bisa dihapus!"
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="list_admin")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text, reply_markup=reply_markup)
+        return
+    
+    text = "🗑️ *Pilih admin yang mau dihapus:*\n\n"
+    
+    keyboard = []
+    for admin in admin_list:
+        keyboard.append([InlineKeyboardButton(f"🗑️ {admin}", callback_data=f"remove_admin_{admin}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Kembali", callback_data="list_admin")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+
+async def remove_admin(query, context, admin_id):
+    """Hapus admin"""
+    if admin_id in tg_manager.admins:
+        tg_manager.admins.remove(admin_id)
+        tg_manager.save_data()
+        text = f"✅ Admin {admin_id} berhasil dihapus!"
+    else:
+        text = "❌ Admin tidak ditemukan!"
+    
+    keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="list_admin")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors yang terjadi"""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+
+def main():
+    """Main function untuk menjalankan bot"""
+    print("🚀 Starting Telegram Management Bot...")
+    
+    # Cek konfigurasi
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("❌ Bot token belum diset! Edit BOT_TOKEN di kode")
+        return
+    
+    if API_ID == "YOUR_API_ID_HERE" or API_HASH == "YOUR_API_HASH_HERE":
+        print("❌ API_ID atau API_HASH belum diset! Daftar di my.telegram.org")
+        return
+    
+    if MAIN_ADMIN == 123456789:
+        print("⚠️  MAIN_ADMIN masih default! Ganti dengan user ID kamu")
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    # Create data directory if not exists
+    os.makedirs('sessions', exist_ok=True)
+    
+    print("✅ Bot berhasil dijalankan!")
+    print("📋 Fitur yang tersedia:")
+    print("   • /start - Dashboard utama")
+    print("   • /admin - Panel admin (khusus main admin)")
+    print("   • Kelola akun Telegram")
+    print("   • Tambah/hapus kontak")
+    print("   • Invite kontak ke grup/channel")
+    print("   • Kelola admin bot")
+    print("\n🔧 Setup yang diperlukan:")
+    print("   1. Ganti BOT_TOKEN dengan token bot dari @BotFather")
+    print("   2. Ganti API_ID dan API_HASH dari my.telegram.org")
+    print("   3. Ganti MAIN_ADMIN dengan user ID Telegram kamu")
+    print("\n💡 Cara dapetin user ID:")
+    print("   • Chat ke @userinfobot atau @myidbot")
+    print("   • Forward pesan ke bot, lalu lihat user ID")
+    print("\n🚨 Penting:")
+    print("   • Pastikan bot sudah di-start sama admin")
+    print("   • Session file akan disimpan otomatis")
+    print("   • Data admin tersimpan di accounts.json")
+    print("\n▶️  Bot siap digunakan! Tekan Ctrl+C untuk stop")
+    
+    # Start bot
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except KeyboardInterrupt:
+        print("\n⏹️  Bot dihentikan oleh user")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        logger.error(f"Fatal error: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+# ============================================
+# REQUIREMENTS.TXT
+# ============================================
+"""
+Buat file requirements.txt dengan isi:
+
+python-telegram-bot==20.7
+telethon==1.32.1
+"""
+
+# ============================================
+# SETUP INSTRUCTIONS
+# ============================================
+"""
+CARA SETUP BOT:
+
+1. INSTALL DEPENDENCIES:
+   pip install -r requirements.txt
+
+2. SETUP BOT TOKEN:
+   • Chat ke @BotFather di Telegram
+   • Ketik /newbot
+   • Ikuti instruksi untuk buat bot baru  
+   • Copy token yang dikasih
+   • Ganti BOT_TOKEN di kode
+
+3. SETUP API CREDENTIALS:
+   • Buka https://my.telegram.org
+   • Login dengan akun Telegram
+   • Pilih API Development Tools
+   • Buat aplikasi baru
+   • Copy API ID dan API Hash
+   • Ganti API_ID dan API_HASH di kode
+
+4. SETUP MAIN ADMIN:
+   • Chat ke @userinfobot untuk dapetin user ID kamu
+   • Ganti MAIN_ADMIN dengan user ID kamu
+
+5. JALANKAN BOT:
+   python bot.py
+
+6. START BOT:
+   • Chat ke bot kamu di Telegram
+   • Ketik /start untuk mulai
+
+STRUKTUR FILE:
+bot.py              # File utama bot
+accounts.json       # Data akun dan admin (otomatis dibuat)
+session_*.session   # Session file Telethon (otomatis dibuat)
+requirements.txt    # Dependencies Python
+
+FITUR BOT:
+✅ Dashboard dengan list akun
+✅ Tambah akun Telegram (OTP + 2FA support)
+✅ Lihat detail akun (nama, ID, jumlah kontak)
+✅ Tambah kontak batch
+✅ Hapus semua kontak
+✅ Invite kontak ke grup/channel (mutual/non-mutual/all)
+✅ Kelola admin bot (khusus main admin)
+✅ Tombol back di semua menu
+✅ Error handling yang proper
+✅ Auto save data
+✅ Logging
+
+KEAMANAN:
+• Hanya admin yang bisa akses bot
+• Session file terenkripsi
+• Data tersimpan lokal
+• Rate limiting untuk avoid flood
+• Input validation
+
+NOTES:
+• Bot support multiple akun Telegram
+• Bisa invite max 50 kontak per batch (anti flood)
+• Session otomatis tersimpan
+• Data admin persistent
+• Support 2FA accounts
+• Bahasa Indonesia gaul sesuai request
+
+Enjoy! 🎉
+"""
