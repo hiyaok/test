@@ -509,7 +509,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['last_contact_time'] = current_time
 
 async def process_add_contacts(query, context, phone):
-    """Tambah semua kontak + update progress tiap 1 kontak"""
+    """Tambah semua kontak + update progress tiap 1 kontak + verifikasi save"""
     contacts_to_add = context.user_data.get('contacts_to_add', [])
 
     if not contacts_to_add:
@@ -544,6 +544,7 @@ async def process_add_contacts(query, context, phone):
             reason = None
 
             try:
+                # import kontak
                 await client(functions.contacts.ImportContactsRequest(
                     contacts=[types.InputPhoneContact(
                         client_id=idx,
@@ -552,8 +553,18 @@ async def process_add_contacts(query, context, phone):
                         last_name=last_name
                     )]
                 ))
+
+                # verifikasi apakah tersimpan
+                all_contacts = await client(functions.contacts.GetContactsRequest(hash=0))
+                saved_numbers = [str(u.phone) for u in all_contacts.users if u.phone]
+
+                if phone_num in saved_numbers:
+                    status = "✅ Berhasil & Terverifikasi"
+                else:
+                    status = "⚠ Berhasil tapi belum terverifikasi"
+
                 success_count += 1
-                status = "✅ Berhasil"
+
             except Exception as e:
                 failed_count += 1
                 error_msg = str(e)
@@ -610,7 +621,7 @@ async def process_add_contacts(query, context, phone):
         # ringkasan akhir
         text = (
             "🎉 *Proses selesai!*\n\n"
-            f"📱 Total: {total_contacts}\n"
+            f"📱 Total kontak: {total_contacts}\n"
             f"✅ Berhasil: {success_count}\n"
             f"❌ Gagal: {failed_count}\n\n"
         )
