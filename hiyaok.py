@@ -899,118 +899,74 @@ async def delete_all_contacts(query, context, phone):
         await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
 
 async def delete_account(query, context, phone):
-    """Hapus akun dari bot - tanpa cek authorization"""
+    """Hapus akun dari bot - langsung hapus dari database tanpa cek authorization"""
     try:
-        account_name = "Unknown"
+        await query.edit_message_text("🗑️ Menghapus akun...")
         
-        # Ambil nama akun sebelum dihapus untuk display
+        account_name = "Unknown"
         if phone in tg_manager.accounts:
             account_name = tg_manager.accounts[phone].get('name', phone)
-            
-        # STEP 1: Disconnect dan cleanup client yang mungkin masih aktif
-        session_name = f"session_{phone.replace('+', '')}"
         
-        try:
-            # Coba disconnect jika ada client aktif
-            if phone in tg_manager.clients:
-                await tg_manager.clients[phone].disconnect()
-                del tg_manager.clients[phone]
-                logger.info(f"Disconnected active client for {phone}")
-        except Exception as e:
-            logger.debug(f"No active client to disconnect for {phone}: {e}")
-        
-        # STEP 2: Hapus dari accounts dictionary dan save
-        if phone in tg_manager.accounts:
-            del tg_manager.accounts[phone]
-            tg_manager.save_data()  # Save ke file accounts.json
-            logger.info(f"Removed {phone} ({account_name}) from accounts dictionary")
-        else:
-            logger.warning(f"Account {phone} not found in accounts dictionary")
-        
-        # STEP 3: Hapus session files dengan berbagai kemungkinan format
-        session_patterns = [
-            f"session_{phone.replace('+', '')}.session",  # Format utama
-            f"session_{phone.replace('+', '')}",          # Tanpa .session
-            f"{phone.replace('+', '')}.session",          # Tanpa prefix session_
-            f"session_{phone}.session",                   # Dengan + di nama
-            f"{session_name}.session"                     # Dari variable session_name
+        # Hapus session files
+        session_files_to_delete = [
+            f"session_{phone.replace('+', '')}.session",
+            f"session_{phone.replace('+', '')}",
+            f"{phone.replace('+', '')}.session"
         ]
         
-        deleted_sessions = []
-        for pattern in session_patterns:
-            if os.path.exists(pattern):
+        deleted_count = 0
+        for session_file in session_files_to_delete:
+            if os.path.exists(session_file):
                 try:
-                    os.remove(pattern)
-                    deleted_sessions.append(pattern)
-                    logger.info(f"Deleted session file: {pattern}")
-                except PermissionError:
-                    logger.error(f"Permission denied deleting {pattern}")
+                    os.remove(session_file)
+                    deleted_count += 1
+                    logger.info(f"Deleted: {session_file}")
                 except Exception as e:
-                    logger.error(f"Error deleting {pattern}: {e}")
+                    logger.error(f"Error deleting {session_file}: {e}")
         
-        # STEP 4: Cleanup context data terkait akun ini
-        keys_to_remove = []
-        for key in context.user_data.keys():
-            if phone in str(key):
-                keys_to_remove.append(key)
+        # Disconnect client jika masih aktif
+        if phone in tg_manager.clients:
+            try:
+                await tg_manager.clients[phone].disconnect()
+                del tg_manager.clients[phone]
+            except:
+                pass
         
-        for key in keys_to_remove:
-            context.user_data.pop(key, None)
+        # Hapus dari accounts dictionary
+        if phone in tg_manager.accounts:
+            del tg_manager.accounts[phone]
+            tg_manager.save_data()
         
-        # STEP 5: Reload data untuk memastikan konsistensi
-        tg_manager.load_data()
+        # Success message
+        text = f"✅ Akun berhasil dihapus!\n\n"
+        text += f"👤 Nama: {account_name}\n"
+        text += f"📞 Nomor: {phone}\n"
+        text += f"🗑️ Session files dihapus: {deleted_count}\n"
+        text += f"📱 Sisa akun: {len(tg_manager.accounts)}"
         
-        # STEP 6: Buat response message
-        success_text = f"✅ *Akun berhasil dihapus!*\n\n"
-        success_text += f"👤 Nama: {account_name}\n"
-        success_text += f"📞 Nomor: {phone}\n"
-        
-        if deleted_sessions:
-            success_text += f"🗑️ Session files dihapus: {len(deleted_sessions)}\n"
-            for session in deleted_sessions:
-                success_text += f"   • {session}\n"
-        else:
-            success_text += f"ℹ️ Tidak ada session file yang ditemukan\n"
-        
-        success_text += f"\n📱 Sisa akun terdaftar: {len(tg_manager.accounts)}"
-        
-        keyboard = [[InlineKeyboardButton("🔙 Kembali ke Dashboard", callback_data="back_to_main")]]
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text(
-            success_text,
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
-        
-        logger.info(f"Successfully deleted account {phone} ({account_name})")
+        await query.edit_message_text(text, reply_markup=reply_markup)
         
     except Exception as e:
         logger.error(f"Error deleting account {phone}: {e}")
         
-        # Tetap coba hapus dari dictionary walaupun ada error
-        try:
-            if phone in tg_manager.accounts:
-                del tg_manager.accounts[phone]
-                tg_manager.save_data()
-                logger.info(f"Force removed {phone} from accounts after error")
-        except Exception as save_error:
-            logger.error(f"Failed to force remove account: {save_error}")
+        # Tetap hapus dari dictionary walaupun error
+        if phone in tg_manager.accounts:
+            del tg_manager.accounts[phone]
+            tg_manager.save_data()
         
-        error_text = f"⚠️ *Akun dihapus dengan warning*\n\n"
-        error_text += f"📞 Nomor: {phone}\n"
-        error_text += f"💬 Warning: {str(e)}\n\n"
-        error_text += f"ℹ️ Akun tetap dihapus dari daftar, tapi mungkin ada file yang tidak terhapus.\n"
-        error_text += f"📱 Sisa akun: {len(tg_manager.accounts)}"
+        text = f"⚠️ Akun dihapus dengan warning\n\n"
+        text += f"📞 Nomor: {phone}\n"
+        text += f"Error: {str(e)}\n\n"
+        text += f"Akun tetap dihapus dari daftar.\n"
+        text += f"📱 Sisa akun: {len(tg_manager.accounts)}"
         
-        keyboard = [[InlineKeyboardButton("🔙 Kembali ke Dashboard", callback_data="back_to_main")]]
+        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text(
-            error_text, 
-            parse_mode='Markdown',
-            reply_markup=reply_markup
-        )
+        await query.edit_message_text(text, reply_markup=reply_markup)
 
 # Tambahan: Fungsi helper untuk cleanup session files
 def cleanup_orphaned_sessions():
