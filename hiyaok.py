@@ -509,7 +509,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['last_contact_time'] = current_time
 
 async def process_add_contacts(query, context, phone):
-    """Proses tambah semua kontak yang dikumpulkan"""
+    """Versi simple: ImportContactsRequest + jeda tiap 10 kontak + log gagal detail"""
     contacts_to_add = context.user_data.get('contacts_to_add', [])
 
     if not contacts_to_add:
@@ -528,331 +528,87 @@ async def process_add_contacts(query, context, phone):
             await query.edit_message_text("❌ Akun tidak authorized!", reply_markup=reply_markup)
             return
 
-        # Initialize counters dan error tracking
-        success_count = 0
-        failed_count = 0
-        failed_details = []  # Store failed contacts with reasons
-        
         total_contacts = len(contacts_to_add)
-        
-        # Initial message
-        await query.edit_message_text(f"⏳ Memulai proses tambah {total_contacts} kontak...")
+        success_count, failed_count = 0, 0
+        failed_details = []  # simpan info gagal
 
-        for idx, contact_info in enumerate(contacts_to_add, start=1):
+        msg = await query.edit_message_text(f"⏳ Menyimpan {total_contacts} kontak...")
+
+        for i, contact_info in enumerate(contacts_to_add, start=1):
             phone_num = str(contact_info['phone']).replace(" ", "").replace("+", "")
-            first_name = contact_info.get('first_name') or "Unknown"
+            first_name = contact_info.get('first_name') or "Kontak"
             last_name = contact_info.get('last_name') or ""
-            full_name = f"{first_name} {last_name}".strip()
-
-            # Update progress message
-            progress_text = f"📞 Memproses kontak {idx}/{total_contacts}\n"
-            progress_text += f"👤 {full_name} ({phone_num})\n\n"
-            progress_text += f"✅ Berhasil: {success_count}\n"
-            progress_text += f"❌ Gagal: {failed_count}"
-            
-            try:
-                await query.edit_message_text(progress_text)
-            except Exception as edit_error:
-                logger.debug(f"Failed to edit message: {edit_error}")
 
             try:
-                logger.info(f"[{phone}] Importing contact {phone_num} ({full_name})")
-
-                # STEP 1: Import kontak
-                result = await client(functions.contacts.ImportContactsRequest(
+                await client(functions.contacts.ImportContactsRequest(
                     contacts=[
                         types.InputPhoneContact(
-                            client_id=random.randrange(-2**63, 2**63),
+                            client_id=i,
                             phone=phone_num,
                             first_name=first_name,
                             last_name=last_name
                         )
                     ]
                 ))
-
-                # Check if successful immediately
-                if result.users:
-                    success_count += 1
-                    logger.info(f"[{phone}] {phone_num} berhasil disave (direct)")
-                    
-                    # Update success message
-                    success_text = f"✅ Kontak {idx}/{total_contacts} berhasil ditambah\n"
-                    success_text += f"👤 {full_name}\n\n"
-                    success_text += f"✅ Berhasil: {success_count}\n"
-                    success_text += f"❌ Gagal: {failed_count}"
-                    
-                    try:
-                        await query.edit_message_text(success_text)
-                    except Exception:
-                        pass
-                    
-                    # Delay antar kontak - 3 detik
-                    await asyncio.sleep(3)
-                    continue
-
-                # STEP 2: Manual verification - cek apakah kontak tersimpan
-                try:
-                    # Delay sebelum GetContactsRequest untuk avoid flood
-                    await asyncio.sleep(2)
-                    
-                    contacts_result = await client(functions.contacts.GetContactsRequest(hash=0))
-                    saved_numbers = []
-                    
-                    for user in contacts_result.users:
-                        if isinstance(user, types.User) and user.phone:
-                            saved_numbers.append(user.phone)
-                    
-                    # Cek apakah nomor sudah tersimpan (dengan dan tanpa country code)
-                    phone_variations = [
-                        phone_num,
-                        phone_num.lstrip('0'),  # Remove leading zero
-                        f"62{phone_num.lstrip('0')}" if phone_num.startswith('08') else phone_num,  # Add 62 for Indonesian numbers
-                        phone_num[2:] if phone_num.startswith('62') else phone_num  # Remove 62
-                    ]
-                    
-                    found_saved = any(variation in saved_numbers for variation in phone_variations)
-                    
-                    if found_saved:
-                        success_count += 1
-                        logger.info(f"[{phone}] {phone_num} sudah tersimpan (verified)")
-                        
-                        # Update success message
-                        success_text = f"✅ Kontak {idx}/{total_contacts} berhasil ditambah (verified)\n"
-                        success_text += f"👤 {full_name}\n\n"
-                        success_text += f"✅ Berhasil: {success_count}\n"
-                        success_text += f"❌ Gagal: {failed_count}"
-                        
-                        try:
-                            await query.edit_message_text(success_text)
-                        except Exception:
-                            pass
-                        
-                        # Delay antar kontak - 3 detik
-                        await asyncio.sleep(3)
-                        continue
-                    
-                except Exception as check_error:
-                    # Handle GetContactsRequest flood wait
-                    if "FLOOD_WAIT" in str(check_error):
-                        try:
-                            wait_time = int(str(check_error).split('_')[2])
-                            
-                            # Countdown untuk flood wait GetContactsRequest
-                            for remaining in range(wait_time, 0, -1):
-                                flood_text = f"⏰ GetContacts flood protection\n"
-                                flood_text += f"⏳ Tunggu {remaining} detik lagi...\n\n"
-                                flood_text += f"📊 Progress: {idx}/{total_contacts}\n"
-                                flood_text += f"👤 Sedang verifikasi: {full_name}\n"
-                                flood_text += f"✅ Berhasil: {success_count}\n"
-                                flood_text += f"❌ Gagal: {failed_count}"
-                                
-                                try:
-                                    await query.edit_message_text(flood_text)
-                                except Exception:
-                                    pass
-                                await asyncio.sleep(1)
-                            
-                            # Retry GetContactsRequest setelah flood wait
-                            contacts_result = await client(functions.contacts.GetContactsRequest(hash=0))
-                            saved_numbers = [u.phone for u in contacts_result.users if isinstance(u, types.User) and u.phone]
-                            
-                            phone_variations = [
-                                phone_num,
-                                phone_num.lstrip('0'),
-                                f"62{phone_num.lstrip('0')}" if phone_num.startswith('08') else phone_num,
-                                phone_num[2:] if phone_num.startswith('62') else phone_num
-                            ]
-                            
-                            if any(variation in saved_numbers for variation in phone_variations):
-                                success_count += 1
-                                logger.info(f"[{phone}] {phone_num} berhasil setelah flood wait")
-                                
-                                success_text = f"✅ Kontak {idx}/{total_contacts} berhasil (after flood wait)\n"
-                                success_text += f"👤 {full_name}\n\n"
-                                success_text += f"✅ Berhasil: {success_count}\n"
-                                success_text += f"❌ Gagal: {failed_count}"
-                                
-                                try:
-                                    await query.edit_message_text(success_text)
-                                except Exception:
-                                    pass
-                                
-                                await asyncio.sleep(3)
-                                continue
-                                
-                        except (ValueError, IndexError):
-                            await asyncio.sleep(60)  # Default wait
-                    else:
-                        logger.warning(f"[{phone}] Error checking contacts: {check_error}")
-
-                # STEP 3: Retry mechanism jika belum berhasil
-                try:
-                    # Delete dan retry import
-                    try:
-                        entity = await client.get_entity(phone_num)
-                        if isinstance(entity, types.User):
-                            await client(functions.contacts.DeleteContactsRequest(id=[entity.id]))
-                            await asyncio.sleep(2)
-                    except Exception as e:
-                        logger.debug(f"[{phone}] Tidak bisa delete {phone_num}: {e}")
-
-                    retry_result = await client(functions.contacts.ImportContactsRequest(
-                        contacts=[
-                            types.InputPhoneContact(
-                                client_id=random.randrange(-2**63, 2**63),
-                                phone=phone_num,
-                                first_name=first_name,
-                                last_name=last_name
-                            )
-                        ]
-                    ))
-
-                    if retry_result.users:
-                        success_count += 1
-                        logger.info(f"[{phone}] {phone_num} berhasil disave (retry)")
-                        
-                        success_text = f"✅ Kontak {idx}/{total_contacts} berhasil (retry)\n"
-                        success_text += f"👤 {full_name}\n\n"
-                        success_text += f"✅ Berhasil: {success_count}\n"
-                        success_text += f"❌ Gagal: {failed_count}"
-                        
-                        try:
-                            await query.edit_message_text(success_text)
-                        except Exception:
-                            pass
-                    else:
-                        failed_count += 1
-                        reason = "Nomor tidak terdaftar di Telegram"
-                        failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
-                        logger.error(f"[{phone}] {phone_num} tetap gagal - {reason}")
-                        
-                        failed_text = f"❌ Kontak {idx}/{total_contacts} gagal ditambah\n"
-                        failed_text += f"👤 {full_name} - {reason}\n\n"
-                        failed_text += f"✅ Berhasil: {success_count}\n"
-                        failed_text += f"❌ Gagal: {failed_count}"
-                        
-                        try:
-                            await query.edit_message_text(failed_text)
-                        except Exception:
-                            pass
-
-                except Exception as retry_error:
-                    failed_count += 1
-                    reason = f"Error retry: {str(retry_error)[:50]}..."
-                    failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
-                    logger.error(f"[{phone}] Retry error for {phone_num}: {retry_error}")
-
+                success_count += 1
             except Exception as e:
+                reason = str(e).split("\n")[0]  # ambil pesan error singkat
+                logger.warning(f"[{phone}] gagal import {phone_num}: {reason}")
                 failed_count += 1
-                error_msg = str(e)
-                
-                # Detect specific error types
-                if "FLOOD_WAIT" in error_msg:
-                    try:
-                        wait_time = int(error_msg.split('_')[2])
-                        reason = f"Rate limit - tunggu {wait_time} detik"
-                        
-                        # Handle import flood wait
-                        for remaining in range(wait_time, 0, -1):
-                            flood_text = f"⏰ Import flood protection aktif\n"
-                            flood_text += f"⏳ Tunggu {remaining} detik lagi...\n\n"
-                            flood_text += f"📊 Progress: {idx}/{total_contacts}\n"
-                            flood_text += f"👤 {full_name}\n"
-                            flood_text += f"✅ Berhasil: {success_count}\n"
-                            flood_text += f"❌ Gagal: {failed_count}"
-                            
-                            try:
-                                await query.edit_message_text(flood_text)
-                            except Exception:
-                                pass
-                            await asyncio.sleep(1)
-                            
-                    except (ValueError, IndexError):
-                        reason = "Rate limit - waktu tidak diketahui"
-                        await asyncio.sleep(60)
-                        
-                elif "PHONE_NUMBER_INVALID" in error_msg:
-                    reason = "Format nomor tidak valid"
-                elif "USER_PRIVACY_RESTRICTED" in error_msg:
-                    reason = "Privacy settings user"
-                elif "PEER_FLOOD" in error_msg:
-                    reason = "Terlalu banyak request"
-                else:
-                    reason = f"Error: {error_msg[:50]}..."
-                
-                failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
-                logger.error(f"[{phone}] Error menambahkan kontak {phone_num}: {e}")
-                
-                # Update failed message with reason
-                failed_text = f"❌ Kontak {idx}/{total_contacts} gagal ditambah\n"
-                failed_text += f"👤 {full_name}\n"
-                failed_text += f"💬 Alasan: {reason}\n\n"
-                failed_text += f"✅ Berhasil: {success_count}\n"
-                failed_text += f"❌ Gagal: {failed_count}"
-                
+                failed_details.append(f"📱 {phone_num} | 🆔 {phone}\n   ❌ {reason}")
+
+            # update progres tiap 5 kontak atau terakhir
+            if i % 5 == 0 or i == total_contacts:
                 try:
-                    await query.edit_message_text(failed_text)
+                    await msg.edit(
+                        f"⏳ Proses {i}/{total_contacts} kontak...\n"
+                        f"✅ Berhasil: {success_count}\n"
+                        f"❌ Gagal: {failed_count}"
+                    )
                 except Exception:
                     pass
 
-            # Delay antar kontak - 3 detik (jika belum ada delay di atas)
-            await asyncio.sleep(3)
+            # delay normal
+            await asyncio.sleep(2)
 
-            # Jeda 2 menit hanya jika lebih dari 10 kontak DAN kelipatan 10
-            if total_contacts > 10 and idx % 10 == 0 and idx < total_contacts:
-                rest_duration = 120  # 2 menit = 120 detik
-                
-                # Countdown timer untuk jeda 2 menit
-                for remaining in range(rest_duration, 0, -1):
-                    minutes = remaining // 60
-                    seconds = remaining % 60
-                    
-                    rest_text = f"😴 Istirahat 2 menit (tiap 10 kontak)\n"
-                    rest_text += f"⏰ Sisa waktu: {minutes:02d}:{seconds:02d}\n\n"
-                    rest_text += f"📊 Progress: {idx}/{total_contacts}\n"
-                    rest_text += f"✅ Berhasil: {success_count}\n"
-                    rest_text += f"❌ Gagal: {failed_count}"
-                    
-                    try:
-                        await query.edit_message_text(rest_text)
-                    except Exception:
-                        pass
-                    
-                    await asyncio.sleep(1)
-                
-                logger.info(f"[{phone}] Selesai istirahat 2 menit setelah {idx} kontak")
+            # kalau sudah kelipatan 10, jeda 2 menit
+            if i % 10 == 0 and i < total_contacts:
+                try:
+                    await msg.edit(
+                        f"⏸ Istirahat 2 menit dulu biar aman limit...\n\n"
+                        f"Progress: {i}/{total_contacts}"
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(120)  # 2 menit
 
         await client.disconnect()
 
-        # Final summary message
-        text = f"🎉 *Proses Selesai!*\n\n"
-        text += f"📊 *Ringkasan:*\n"
-        text += f"✅ Berhasil: {success_count}\n"
-        text += f"❌ Gagal: {failed_count}\n"
-        text += f"📱 Total: {total_contacts}\n\n"
-        
+        # summary akhir
+        text = (
+            "🎉 *Proses selesai!*\n\n"
+            f"📱 Total kontak: {total_contacts}\n"
+            f"✅ Berhasil: {success_count}\n"
+            f"❌ Gagal: {failed_count}"
+        )
+
         if failed_details:
-            text += f"❌ *Detail Kegagalan:*\n"
-            # Limit failed details to prevent message too long
-            for detail in failed_details[:10]:  # Show max 10 failed details
-                text += f"{detail}\n"
-            
-            if len(failed_details) > 10:
-                text += f"... dan {len(failed_details) - 10} lainnya"
+            text += "\n\n🚫 *Detail Gagal:*\n" + "\n\n".join(failed_details[:15])
+            if failed_count > 15:
+                text += f"\n\n...dan {failed_count-15} kontak gagal lainnya."
 
         keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
+        await msg.edit(text, parse_mode="Markdown", reply_markup=reply_markup)
 
-        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
-
-        # Clear session data
+        # clear setelah selesai
         context.user_data.pop("contacts_to_add", None)
 
     except Exception as e:
-        logger.error(f"[{phone}] Error processing contacts: {e}")
+        logger.error(f"[{phone}] Error: {e}")
         keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
+        await query.edit_message_text(f"❌ Error: {e}", reply_markup=reply_markup)
 
 async def delete_all_contacts(query, context, phone):
     """Hapus semua kontak"""
