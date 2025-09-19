@@ -240,9 +240,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "list_admin" and tg_manager.is_main_admin(user_id):
         await admin_panel(query, context)
 
+# Tambahan: Update fungsi back_to_main_menu untuk refresh data yang benar
 async def back_to_main_menu(query, context):
-    """Kembali ke main menu"""
-    context.user_data.clear()  # Clear semua session data
+    """Kembali ke main menu dengan data terbaru"""
+    # Clear semua session data
+    context.user_data.clear()
+    
+    # Reload data dari file untuk memastikan data terbaru
+    tg_manager.load_data()
     
     total_accounts = len(tg_manager.accounts)
     
@@ -258,14 +263,29 @@ async def back_to_main_menu(query, context):
         text += "*Pilih akun untuk dikelola:*"
         
         keyboard = []
+        # Pastikan hanya akun yang masih ada yang ditampilkan
         for phone, data in tg_manager.accounts.items():
             name = data.get('name', phone)
             keyboard.append([InlineKeyboardButton(f"📞 {name}", callback_data=f"account_{phone}")])
         
         keyboard.append([InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")])
     
+    # Tambah tombol admin jika main admin
+    user_id = query.from_user.id if hasattr(query, 'from_user') else None
+    if user_id and tg_manager.is_main_admin(user_id):
+        keyboard.append([InlineKeyboardButton("👑 Panel Admin", callback_data="list_admin")])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+    
+    try:
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error updating main menu: {e}")
+        # Fallback jika edit gagal
+        try:
+            await query.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        except Exception as e2:
+            logger.error(f"Error sending new message: {e2}")
 
 async def start_add_account(query, context):
     """Mulai proses tambah akun"""
@@ -730,26 +750,108 @@ async def delete_all_contacts(query, context, phone):
 async def delete_account(query, context, phone):
     """Hapus akun dari bot"""
     try:
+        # Disconnect client jika masih aktif
+        if phone in tg_manager.clients:
+            try:
+                await tg_manager.clients[phone].disconnect()
+                del tg_manager.clients[phone]
+            except Exception as e:
+                logger.debug(f"Error disconnecting client: {e}")
+        
+        # Hapus dari dictionary accounts
         if phone in tg_manager.accounts:
+            account_name = tg_manager.accounts[phone].get('name', phone)
             del tg_manager.accounts[phone]
             tg_manager.save_data()
-            
-            # Hapus session file
-            session_file = f"session_{phone.replace('+', '')}.session"
-            if os.path.exists(session_file):
-                os.remove(session_file)
+            logger.info(f"Deleted account {phone} ({account_name}) from accounts list")
         
-        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="back_to_main")]]
+        # Hapus session file dengan berbagai format kemungkinan
+        session_patterns = [
+            f"session_{phone.replace('+', '')}",
+            f"session_{phone.replace('+', '')}.session", 
+            f"{phone.replace('+', '')}.session",
+            f"session_{phone}",
+            f"session_{phone}.session"
+        ]
+        
+        deleted_files = []
+        for pattern in session_patterns:
+            if os.path.exists(pattern):
+                try:
+                    os.remove(pattern)
+                    deleted_files.append(pattern)
+                    logger.info(f"Deleted session file: {pattern}")
+                except Exception as e:
+                    logger.error(f"Error deleting {pattern}: {e}")
+        
+        # Buat response message
+        success_text = f"✅ *Akun berhasil dihapus!*\n\n"
+        success_text += f"📞 Nomor: {phone}\n"
+        
+        if deleted_files:
+            success_text += f"🗑️ File session dihapus: {len(deleted_files)}\n"
+        else:
+            success_text += f"ℹ️ Tidak ada file session yang ditemukan\n"
+        
+        success_text += f"\n📱 Sisa akun: {len(tg_manager.accounts)}"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Kembali ke Dashboard", callback_data="back_to_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await query.edit_message_text(
-            f"✅ Akun {phone} berhasil dihapus!",
+            success_text,
+            parse_mode='Markdown',
             reply_markup=reply_markup
         )
+        
+        # Clear any related context data
+        context.user_data.pop(f'client_{phone}', None)
+        context.user_data.pop(f'session_{phone}', None)
+        
     except Exception as e:
-        logger.error(f"Error deleting account: {e}")
-        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data=f"account_{phone}")]]
+        logger.error(f"Error deleting account {phone}: {e}")
+        
+        # Fallback error message
+        error_text = f"❌ *Error saat hapus akun*\n\n"
+        error_text += f"📞 Nomor: {phone}\n"
+        error_text += f"💬 Error: {str(e)}\n\n"
+        error_text += "⚠️ Mungkin akun sudah terhapus atau ada masalah file system"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Kembali ke Dashboard", callback_data="back_to_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
+        
+        await query.edit_message_text(
+            error_text, 
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+
+# Tambahan: Fungsi helper untuk cleanup session files
+def cleanup_orphaned_sessions():
+    """Bersihkan file session yang tidak punya akun lagi"""
+    try:
+        # Get semua file session
+        session_files = [f for f in os.listdir('.') if f.startswith('session_') and f.endswith('.session')]
+        
+        active_phones = set()
+        for phone in tg_manager.accounts.keys():
+            clean_phone = phone.replace('+', '')
+            active_phones.add(f"session_{clean_phone}.session")
+        
+        orphaned = []
+        for session_file in session_files:
+            if session_file not in active_phones:
+                try:
+                    os.remove(session_file)
+                    orphaned.append(session_file)
+                    logger.info(f"Cleaned up orphaned session: {session_file}")
+                except Exception as e:
+                    logger.error(f"Error cleaning {session_file}: {e}")
+        
+        return len(orphaned)
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+        return 0
 
 async def start_invite_process(query, context, phone):
     """Mulai proses invite ke grup/channel"""
