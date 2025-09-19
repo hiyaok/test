@@ -50,27 +50,55 @@ class TelegramManager:
         self.load_data()
         
     def load_data(self):
-        """Load data dari file"""
+        """Load data dari file dengan better error handling"""
         try:
             if os.path.exists('accounts.json'):
                 with open('accounts.json', 'r') as f:
                     data = json.load(f)
                     self.accounts = data.get('accounts', {})
                     self.admins = data.get('admins', [MAIN_ADMIN])
+                    logger.info(f"Loaded {len(self.accounts)} accounts from file")
+            else:
+                # Buat file baru jika tidak ada
+                self.accounts = {}
+                self.admins = [MAIN_ADMIN]
+                self.save_data()
+                logger.info("Created new accounts.json file")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error in accounts.json: {e}")
+            # Backup file yang rusak dan buat baru
+            if os.path.exists('accounts.json'):
+                os.rename('accounts.json', f'accounts.json.backup.{int(time.time())}')
+            self.accounts = {}
+            self.admins = [MAIN_ADMIN]
+            self.save_data()
         except Exception as e:
             logger.error(f"Error loading data: {e}")
+            self.accounts = {}
+            self.admins = [MAIN_ADMIN]
     
     def save_data(self):
-        """Save data ke file"""
+        """Save data ke file dengan better error handling"""
         try:
             data = {
                 'accounts': self.accounts,
-                'admins': self.admins
+                'admins': self.admins,
+                'last_updated': datetime.now().isoformat()
             }
-            with open('accounts.json', 'w') as f:
-                json.dump(data, f, indent=2)
+            
+            # Atomic write - tulis ke temp file dulu
+            with open('accounts.json.tmp', 'w') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            # Pindah temp file ke file asli
+            os.replace('accounts.json.tmp', 'accounts.json')
+            logger.info(f"Saved {len(self.accounts)} accounts to file")
+            
         except Exception as e:
             logger.error(f"Error saving data: {e}")
+            # Cleanup temp file jika ada error
+            if os.path.exists('accounts.json.tmp'):
+                os.remove('accounts.json.tmp')
     
     def is_admin(self, user_id: int) -> bool:
         """Cek apakah user adalah admin"""
@@ -79,6 +107,38 @@ class TelegramManager:
     def is_main_admin(self, user_id: int) -> bool:
         """Cek apakah user adalah main admin"""
         return user_id == MAIN_ADMIN
+    
+    def debug_accounts_storage(self):
+        """Debug function untuk cek status penyimpanan"""
+        try:
+            print(f"=== DEBUG ACCOUNTS STORAGE ===")
+            print(f"Total accounts in memory: {len(self.accounts)}")
+            
+            for phone, data in self.accounts.items():
+                print(f"  • {phone}: {data}")
+            
+            # Cek file accounts.json
+            if os.path.exists('accounts.json'):
+                with open('accounts.json', 'r') as f:
+                    file_data = json.load(f)
+                    file_accounts = file_data.get('accounts', {})
+                    print(f"Total accounts in file: {len(file_accounts)}")
+                    
+                    for phone, data in file_accounts.items():
+                        print(f"  FILE • {phone}: {data}")
+            else:
+                print("accounts.json file not found")
+            
+            # Cek session files
+            session_files = [f for f in os.listdir('.') if 'session' in f]
+            print(f"Session files found: {len(session_files)}")
+            for session in session_files:
+                print(f"  SESSION • {session}")
+            
+            print(f"=== END DEBUG ===")
+            
+        except Exception as e:
+            print(f"Debug error: {e}")
     
     async def create_client(self, phone: str) -> TelegramClient:
         """Buat client Telethon baru"""
@@ -510,12 +570,7 @@ async def process_add_contacts(query, context, phone):
                     ]
                 ))
 
-                # Delay dinamis antar kontak
-                delay = random.uniform(2.5, 5.0)
-                logger.debug(f"[{phone}] Delay {delay:.2f} detik sebelum lanjut...")
-                await asyncio.sleep(delay)
-
-                # Check if successful
+                # Check if successful immediately
                 if result.users:
                     success_count += 1
                     logger.info(f"[{phone}] {phone_num} berhasil disave (direct)")
@@ -530,79 +585,162 @@ async def process_add_contacts(query, context, phone):
                         await query.edit_message_text(success_text)
                     except Exception:
                         pass
+                    
+                    # Delay antar kontak - 3 detik
+                    await asyncio.sleep(3)
                     continue
 
-                # STEP 2: Manual check if contact was saved
-                contacts = await client(functions.contacts.GetContactsRequest(hash=0))
-                saved_numbers = [u.phone for u in contacts.users if isinstance(u, types.User)]
-
-                if phone_num in saved_numbers:
-                    success_count += 1
-                    logger.info(f"[{phone}] {phone_num} sudah tersimpan")
-                    
-                    # Update success message
-                    success_text = f"✅ Kontak {idx}/{total_contacts} berhasil ditambah\n"
-                    success_text += f"👤 {full_name}\n\n"
-                    success_text += f"✅ Berhasil: {success_count}\n"
-                    success_text += f"❌ Gagal: {failed_count}"
-                    
-                    try:
-                        await query.edit_message_text(success_text)
-                    except Exception:
-                        pass
-                    continue
-
-                # STEP 3: Retry mechanism
+                # STEP 2: Manual verification - cek apakah kontak tersimpan
                 try:
-                    entity = await client.get_entity(phone_num)
-                    if isinstance(entity, types.User):
-                        await client(functions.contacts.DeleteContactsRequest(id=[entity.id]))
-                        await asyncio.sleep(2)
-                except Exception as e:
-                    logger.debug(f"[{phone}] Tidak bisa delete {phone_num}: {e}")
-
-                retry = await client(functions.contacts.ImportContactsRequest(
-                    contacts=[
-                        types.InputPhoneContact(
-                            client_id=random.randrange(-2**63, 2**63),
-                            phone=phone_num,
-                            first_name=first_name,
-                            last_name=last_name
-                        )
+                    # Delay sebelum GetContactsRequest untuk avoid flood
+                    await asyncio.sleep(2)
+                    
+                    contacts_result = await client(functions.contacts.GetContactsRequest(hash=0))
+                    saved_numbers = []
+                    
+                    for user in contacts_result.users:
+                        if isinstance(user, types.User) and user.phone:
+                            saved_numbers.append(user.phone)
+                    
+                    # Cek apakah nomor sudah tersimpan (dengan dan tanpa country code)
+                    phone_variations = [
+                        phone_num,
+                        phone_num.lstrip('0'),  # Remove leading zero
+                        f"62{phone_num.lstrip('0')}" if phone_num.startswith('08') else phone_num,  # Add 62 for Indonesian numbers
+                        phone_num[2:] if phone_num.startswith('62') else phone_num  # Remove 62
                     ]
-                ))
-                await asyncio.sleep(random.uniform(2.5, 5.0))
+                    
+                    found_saved = any(variation in saved_numbers for variation in phone_variations)
+                    
+                    if found_saved:
+                        success_count += 1
+                        logger.info(f"[{phone}] {phone_num} sudah tersimpan (verified)")
+                        
+                        # Update success message
+                        success_text = f"✅ Kontak {idx}/{total_contacts} berhasil ditambah (verified)\n"
+                        success_text += f"👤 {full_name}\n\n"
+                        success_text += f"✅ Berhasil: {success_count}\n"
+                        success_text += f"❌ Gagal: {failed_count}"
+                        
+                        try:
+                            await query.edit_message_text(success_text)
+                        except Exception:
+                            pass
+                        
+                        # Delay antar kontak - 3 detik
+                        await asyncio.sleep(3)
+                        continue
+                    
+                except Exception as check_error:
+                    # Handle GetContactsRequest flood wait
+                    if "FLOOD_WAIT" in str(check_error):
+                        try:
+                            wait_time = int(str(check_error).split('_')[2])
+                            
+                            # Countdown untuk flood wait GetContactsRequest
+                            for remaining in range(wait_time, 0, -1):
+                                flood_text = f"⏰ GetContacts flood protection\n"
+                                flood_text += f"⏳ Tunggu {remaining} detik lagi...\n\n"
+                                flood_text += f"📊 Progress: {idx}/{total_contacts}\n"
+                                flood_text += f"👤 Sedang verifikasi: {full_name}\n"
+                                flood_text += f"✅ Berhasil: {success_count}\n"
+                                flood_text += f"❌ Gagal: {failed_count}"
+                                
+                                try:
+                                    await query.edit_message_text(flood_text)
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(1)
+                            
+                            # Retry GetContactsRequest setelah flood wait
+                            contacts_result = await client(functions.contacts.GetContactsRequest(hash=0))
+                            saved_numbers = [u.phone for u in contacts_result.users if isinstance(u, types.User) and u.phone]
+                            
+                            phone_variations = [
+                                phone_num,
+                                phone_num.lstrip('0'),
+                                f"62{phone_num.lstrip('0')}" if phone_num.startswith('08') else phone_num,
+                                phone_num[2:] if phone_num.startswith('62') else phone_num
+                            ]
+                            
+                            if any(variation in saved_numbers for variation in phone_variations):
+                                success_count += 1
+                                logger.info(f"[{phone}] {phone_num} berhasil setelah flood wait")
+                                
+                                success_text = f"✅ Kontak {idx}/{total_contacts} berhasil (after flood wait)\n"
+                                success_text += f"👤 {full_name}\n\n"
+                                success_text += f"✅ Berhasil: {success_count}\n"
+                                success_text += f"❌ Gagal: {failed_count}"
+                                
+                                try:
+                                    await query.edit_message_text(success_text)
+                                except Exception:
+                                    pass
+                                
+                                await asyncio.sleep(3)
+                                continue
+                                
+                        except (ValueError, IndexError):
+                            await asyncio.sleep(60)  # Default wait
+                    else:
+                        logger.warning(f"[{phone}] Error checking contacts: {check_error}")
 
-                if retry.users:
-                    success_count += 1
-                    logger.info(f"[{phone}] {phone_num} berhasil disave (retry)")
-                    
-                    # Update success message
-                    success_text = f"✅ Kontak {idx}/{total_contacts} berhasil ditambah (retry)\n"
-                    success_text += f"👤 {full_name}\n\n"
-                    success_text += f"✅ Berhasil: {success_count}\n"
-                    success_text += f"❌ Gagal: {failed_count}"
-                    
+                # STEP 3: Retry mechanism jika belum berhasil
+                try:
+                    # Delete dan retry import
                     try:
-                        await query.edit_message_text(success_text)
-                    except Exception:
-                        pass
-                else:
+                        entity = await client.get_entity(phone_num)
+                        if isinstance(entity, types.User):
+                            await client(functions.contacts.DeleteContactsRequest(id=[entity.id]))
+                            await asyncio.sleep(2)
+                    except Exception as e:
+                        logger.debug(f"[{phone}] Tidak bisa delete {phone_num}: {e}")
+
+                    retry_result = await client(functions.contacts.ImportContactsRequest(
+                        contacts=[
+                            types.InputPhoneContact(
+                                client_id=random.randrange(-2**63, 2**63),
+                                phone=phone_num,
+                                first_name=first_name,
+                                last_name=last_name
+                            )
+                        ]
+                    ))
+
+                    if retry_result.users:
+                        success_count += 1
+                        logger.info(f"[{phone}] {phone_num} berhasil disave (retry)")
+                        
+                        success_text = f"✅ Kontak {idx}/{total_contacts} berhasil (retry)\n"
+                        success_text += f"👤 {full_name}\n\n"
+                        success_text += f"✅ Berhasil: {success_count}\n"
+                        success_text += f"❌ Gagal: {failed_count}"
+                        
+                        try:
+                            await query.edit_message_text(success_text)
+                        except Exception:
+                            pass
+                    else:
+                        failed_count += 1
+                        reason = "Nomor tidak terdaftar di Telegram"
+                        failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
+                        logger.error(f"[{phone}] {phone_num} tetap gagal - {reason}")
+                        
+                        failed_text = f"❌ Kontak {idx}/{total_contacts} gagal ditambah\n"
+                        failed_text += f"👤 {full_name} - {reason}\n\n"
+                        failed_text += f"✅ Berhasil: {success_count}\n"
+                        failed_text += f"❌ Gagal: {failed_count}"
+                        
+                        try:
+                            await query.edit_message_text(failed_text)
+                        except Exception:
+                            pass
+
+                except Exception as retry_error:
                     failed_count += 1
-                    reason = "Kontak tidak ditemukan/tidak terdaftar"
+                    reason = f"Error retry: {str(retry_error)[:50]}..."
                     failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
-                    logger.error(f"[{phone}] {phone_num} tetap gagal - {reason}")
-                    
-                    # Update failed message
-                    failed_text = f"❌ Kontak {idx}/{total_contacts} gagal ditambah\n"
-                    failed_text += f"👤 {full_name} - {reason}\n\n"
-                    failed_text += f"✅ Berhasil: {success_count}\n"
-                    failed_text += f"❌ Gagal: {failed_count}"
-                    
-                    try:
-                        await query.edit_message_text(failed_text)
-                    except Exception:
-                        pass
+                    logger.error(f"[{phone}] Retry error for {phone_num}: {retry_error}")
 
             except Exception as e:
                 failed_count += 1
@@ -610,9 +748,31 @@ async def process_add_contacts(query, context, phone):
                 
                 # Detect specific error types
                 if "FLOOD_WAIT" in error_msg:
-                    reason = f"Rate limit - tunggu {error_msg.split('_')[2]} detik"
+                    try:
+                        wait_time = int(error_msg.split('_')[2])
+                        reason = f"Rate limit - tunggu {wait_time} detik"
+                        
+                        # Handle import flood wait
+                        for remaining in range(wait_time, 0, -1):
+                            flood_text = f"⏰ Import flood protection aktif\n"
+                            flood_text += f"⏳ Tunggu {remaining} detik lagi...\n\n"
+                            flood_text += f"📊 Progress: {idx}/{total_contacts}\n"
+                            flood_text += f"👤 {full_name}\n"
+                            flood_text += f"✅ Berhasil: {success_count}\n"
+                            flood_text += f"❌ Gagal: {failed_count}"
+                            
+                            try:
+                                await query.edit_message_text(flood_text)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(1)
+                            
+                    except (ValueError, IndexError):
+                        reason = "Rate limit - waktu tidak diketahui"
+                        await asyncio.sleep(60)
+                        
                 elif "PHONE_NUMBER_INVALID" in error_msg:
-                    reason = "Nomor tidak valid"
+                    reason = "Format nomor tidak valid"
                 elif "USER_PRIVACY_RESTRICTED" in error_msg:
                     reason = "Privacy settings user"
                 elif "PEER_FLOOD" in error_msg:
@@ -634,28 +794,12 @@ async def process_add_contacts(query, context, phone):
                     await query.edit_message_text(failed_text)
                 except Exception:
                     pass
-                
-                # Handle flood wait
-                if "FLOOD_WAIT" in error_msg:
-                    try:
-                        wait_time = int(error_msg.split('_')[2])
-                        for remaining in range(wait_time, 0, -1):
-                            flood_text = f"⏰ Flood protection aktif\n"
-                            flood_text += f"⏳ Tunggu {remaining} detik lagi...\n\n"
-                            flood_text += f"📊 Progress: {idx}/{total_contacts}\n"
-                            flood_text += f"✅ Berhasil: {success_count}\n"
-                            flood_text += f"❌ Gagal: {failed_count}"
-                            
-                            try:
-                                await query.edit_message_text(flood_text)
-                            except Exception:
-                                pass
-                            await asyncio.sleep(1)
-                    except (ValueError, IndexError):
-                        await asyncio.sleep(60)  # Default wait
 
-            # Extra delay every 10 contacts - 2 menit
-            if idx % 10 == 0:
+            # Delay antar kontak - 3 detik (jika belum ada delay di atas)
+            await asyncio.sleep(3)
+
+            # Jeda 2 menit hanya jika lebih dari 10 kontak DAN kelipatan 10
+            if total_contacts > 10 and idx % 10 == 0 and idx < total_contacts:
                 rest_duration = 120  # 2 menit = 120 detik
                 
                 # Countdown timer untuk jeda 2 menit
@@ -755,52 +899,80 @@ async def delete_all_contacts(query, context, phone):
         await query.edit_message_text(f"❌ Error: {str(e)}", reply_markup=reply_markup)
 
 async def delete_account(query, context, phone):
-    """Hapus akun dari bot"""
+    """Hapus akun dari bot - tanpa cek authorization"""
     try:
-        # Disconnect client jika masih aktif
-        if phone in tg_manager.clients:
-            try:
-                await tg_manager.clients[phone].disconnect()
-                del tg_manager.clients[phone]
-            except Exception as e:
-                logger.debug(f"Error disconnecting client: {e}")
+        account_name = "Unknown"
         
-        # Hapus dari dictionary accounts
+        # Ambil nama akun sebelum dihapus untuk display
         if phone in tg_manager.accounts:
             account_name = tg_manager.accounts[phone].get('name', phone)
-            del tg_manager.accounts[phone]
-            tg_manager.save_data()
-            logger.info(f"Deleted account {phone} ({account_name}) from accounts list")
+            
+        # STEP 1: Disconnect dan cleanup client yang mungkin masih aktif
+        session_name = f"session_{phone.replace('+', '')}"
         
-        # Hapus session file dengan berbagai format kemungkinan
+        try:
+            # Coba disconnect jika ada client aktif
+            if phone in tg_manager.clients:
+                await tg_manager.clients[phone].disconnect()
+                del tg_manager.clients[phone]
+                logger.info(f"Disconnected active client for {phone}")
+        except Exception as e:
+            logger.debug(f"No active client to disconnect for {phone}: {e}")
+        
+        # STEP 2: Hapus dari accounts dictionary dan save
+        if phone in tg_manager.accounts:
+            del tg_manager.accounts[phone]
+            tg_manager.save_data()  # Save ke file accounts.json
+            logger.info(f"Removed {phone} ({account_name}) from accounts dictionary")
+        else:
+            logger.warning(f"Account {phone} not found in accounts dictionary")
+        
+        # STEP 3: Hapus session files dengan berbagai kemungkinan format
         session_patterns = [
-            f"session_{phone.replace('+', '')}",
-            f"session_{phone.replace('+', '')}.session", 
-            f"{phone.replace('+', '')}.session",
-            f"session_{phone}",
-            f"session_{phone}.session"
+            f"session_{phone.replace('+', '')}.session",  # Format utama
+            f"session_{phone.replace('+', '')}",          # Tanpa .session
+            f"{phone.replace('+', '')}.session",          # Tanpa prefix session_
+            f"session_{phone}.session",                   # Dengan + di nama
+            f"{session_name}.session"                     # Dari variable session_name
         ]
         
-        deleted_files = []
+        deleted_sessions = []
         for pattern in session_patterns:
             if os.path.exists(pattern):
                 try:
                     os.remove(pattern)
-                    deleted_files.append(pattern)
+                    deleted_sessions.append(pattern)
                     logger.info(f"Deleted session file: {pattern}")
+                except PermissionError:
+                    logger.error(f"Permission denied deleting {pattern}")
                 except Exception as e:
                     logger.error(f"Error deleting {pattern}: {e}")
         
-        # Buat response message
+        # STEP 4: Cleanup context data terkait akun ini
+        keys_to_remove = []
+        for key in context.user_data.keys():
+            if phone in str(key):
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            context.user_data.pop(key, None)
+        
+        # STEP 5: Reload data untuk memastikan konsistensi
+        tg_manager.load_data()
+        
+        # STEP 6: Buat response message
         success_text = f"✅ *Akun berhasil dihapus!*\n\n"
+        success_text += f"👤 Nama: {account_name}\n"
         success_text += f"📞 Nomor: {phone}\n"
         
-        if deleted_files:
-            success_text += f"🗑️ File session dihapus: {len(deleted_files)}\n"
+        if deleted_sessions:
+            success_text += f"🗑️ Session files dihapus: {len(deleted_sessions)}\n"
+            for session in deleted_sessions:
+                success_text += f"   • {session}\n"
         else:
-            success_text += f"ℹ️ Tidak ada file session yang ditemukan\n"
+            success_text += f"ℹ️ Tidak ada session file yang ditemukan\n"
         
-        success_text += f"\n📱 Sisa akun: {len(tg_manager.accounts)}"
+        success_text += f"\n📱 Sisa akun terdaftar: {len(tg_manager.accounts)}"
         
         keyboard = [[InlineKeyboardButton("🔙 Kembali ke Dashboard", callback_data="back_to_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -811,18 +983,25 @@ async def delete_account(query, context, phone):
             reply_markup=reply_markup
         )
         
-        # Clear any related context data
-        context.user_data.pop(f'client_{phone}', None)
-        context.user_data.pop(f'session_{phone}', None)
+        logger.info(f"Successfully deleted account {phone} ({account_name})")
         
     except Exception as e:
         logger.error(f"Error deleting account {phone}: {e}")
         
-        # Fallback error message
-        error_text = f"❌ *Error saat hapus akun*\n\n"
+        # Tetap coba hapus dari dictionary walaupun ada error
+        try:
+            if phone in tg_manager.accounts:
+                del tg_manager.accounts[phone]
+                tg_manager.save_data()
+                logger.info(f"Force removed {phone} from accounts after error")
+        except Exception as save_error:
+            logger.error(f"Failed to force remove account: {save_error}")
+        
+        error_text = f"⚠️ *Akun dihapus dengan warning*\n\n"
         error_text += f"📞 Nomor: {phone}\n"
-        error_text += f"💬 Error: {str(e)}\n\n"
-        error_text += "⚠️ Mungkin akun sudah terhapus atau ada masalah file system"
+        error_text += f"💬 Warning: {str(e)}\n\n"
+        error_text += f"ℹ️ Akun tetap dihapus dari daftar, tapi mungkin ada file yang tidak terhapus.\n"
+        error_text += f"📱 Sisa akun: {len(tg_manager.accounts)}"
         
         keyboard = [[InlineKeyboardButton("🔙 Kembali ke Dashboard", callback_data="back_to_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
