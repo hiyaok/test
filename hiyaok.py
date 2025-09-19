@@ -654,22 +654,29 @@ async def process_add_contacts(query, context, phone):
                     except (ValueError, IndexError):
                         await asyncio.sleep(60)  # Default wait
 
-            # Extra delay every 10 contacts
+            # Extra delay every 10 contacts - 2 menit
             if idx % 10 == 0:
-                extra_delay = random.uniform(10, 15)
+                rest_duration = 120  # 2 menit = 120 detik
                 
-                rest_text = f"😴 Istirahat sejenak ({extra_delay:.1f}s)\n"
-                rest_text += f"📊 Progress: {idx}/{total_contacts}\n\n"
-                rest_text += f"✅ Berhasil: {success_count}\n"
-                rest_text += f"❌ Gagal: {failed_count}"
+                # Countdown timer untuk jeda 2 menit
+                for remaining in range(rest_duration, 0, -1):
+                    minutes = remaining // 60
+                    seconds = remaining % 60
+                    
+                    rest_text = f"😴 Istirahat 2 menit (tiap 10 kontak)\n"
+                    rest_text += f"⏰ Sisa waktu: {minutes:02d}:{seconds:02d}\n\n"
+                    rest_text += f"📊 Progress: {idx}/{total_contacts}\n"
+                    rest_text += f"✅ Berhasil: {success_count}\n"
+                    rest_text += f"❌ Gagal: {failed_count}"
+                    
+                    try:
+                        await query.edit_message_text(rest_text)
+                    except Exception:
+                        pass
+                    
+                    await asyncio.sleep(1)
                 
-                try:
-                    await query.edit_message_text(rest_text)
-                except Exception:
-                    pass
-                
-                logger.debug(f"[{phone}] Istirahat {extra_delay:.2f} detik (tiap 10 kontak)")
-                await asyncio.sleep(extra_delay)
+                logger.info(f"[{phone}] Selesai istirahat 2 menit setelah {idx} kontak")
 
         await client.disconnect()
 
