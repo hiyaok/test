@@ -232,7 +232,7 @@ async def show_accounts_page(reply_func, context, page):
             name = data.get('name', phone)
             # Potong nama jika terlalu panjang
             display_name = name[:20] + "..." if len(name) > 20 else name
-            button_text = f"{account_number} {phone}"
+            button_text = f"{account_number}.{phone}"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"account_{phone}")])
         
         # Navigation buttons jika lebih dari 1 halaman
