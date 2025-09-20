@@ -184,7 +184,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Lo gak punya akses ke bot ini!")
         return
     
+    # Reset pagination
+    context.user_data['account_page'] = 0
+    await show_accounts_page(update.message.reply_text, context, 0)
+
+async def show_accounts_page(reply_func, context, page):
+    """Tampilkan halaman akun dengan pagination"""
     total_accounts = len(tg_manager.accounts)
+    accounts_per_page = 10
+    total_pages = (total_accounts + accounts_per_page - 1) // accounts_per_page if total_accounts > 0 else 0
+    
+    # Validasi page
+    if page < 0:
+        page = 0
+    elif page >= total_pages and total_pages > 0:
+        page = total_pages - 1
+    
+    context.user_data['account_page'] = page
     
     if total_accounts == 0:
         text = "🏠 *Dashboard Bot Manager*\n\n"
@@ -193,19 +209,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [[InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")]]
     else:
+        start_idx = page * accounts_per_page
+        end_idx = min(start_idx + accounts_per_page, total_accounts)
+        
         text = f"🏠 *Dashboard Bot Manager*\n\n"
-        text += f"📱 Total Akun: {total_accounts}\n\n"
-        text += "*Pilih akun untuk dikelola:*"
+        text += f"📱 Total Akun: {total_accounts}\n"
+        
+        if total_pages > 1:
+            text += f"📄 Halaman: {page + 1}/{total_pages}\n"
+        
+        text += "\n*Pilih akun untuk dikelola:*"
         
         keyboard = []
-        for phone, data in tg_manager.accounts.items():
+        
+        # Convert dict to list untuk indexing yang konsisten
+        account_items = list(tg_manager.accounts.items())
+        
+        # Tampilkan akun sesuai halaman dengan nomor urut
+        for i in range(start_idx, end_idx):
+            phone, data = account_items[i]
+            account_number = i + 1
             name = data.get('name', phone)
-            keyboard.append([InlineKeyboardButton(f"📞 {phone}", callback_data=f"account_{phone}")])
+            # Potong nama jika terlalu panjang
+            display_name = name[:20] + "..." if len(name) > 20 else name
+            button_text = f"{account_number} {phone}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"account_{phone}")])
+        
+        # Navigation buttons jika lebih dari 1 halaman
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 0:
+                nav_buttons.append(InlineKeyboardButton("⬅️ Sebelumnya", callback_data=f"page_{page-1}"))
+            if page < total_pages - 1:
+                nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page+1}"))
+            
+            if nav_buttons:
+                keyboard.append(nav_buttons)
         
         keyboard.append([InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")])
     
+    # Tambah tombol admin jika main admin
+    user_id = context.user_data.get('current_user_id')
+    if user_id and tg_manager.is_main_admin(user_id):
+        keyboard.append([InlineKeyboardButton("👑 Panel Admin", callback_data="list_admin")])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+    await reply_func(text, parse_mode='Markdown', reply_markup=reply_markup)
 
 async def admin_panel(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     """Handler untuk command /admin - khusus main admin"""
@@ -244,7 +293,7 @@ async def admin_panel(update_or_query, context: ContextTypes.DEFAULT_TYPE):
     await reply_func(text, parse_mode="Markdown", reply_markup=reply_markup)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk semua callback query"""
+    """Handler untuk semua callback query - UPDATE dengan pagination"""
     query = update.callback_query
     user_id = query.from_user.id
     data = query.data
@@ -255,8 +304,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.answer()
     
+    # Store user ID untuk keperluan main admin check
+    context.user_data['current_user_id'] = user_id
+    
     if data == "back_to_main":
         await back_to_main_menu(query, context)
+    elif data.startswith("page_"):
+        # Handle pagination
+        page = int(data.split("page_")[1])
+        await show_accounts_page(query.edit_message_text, context, page)
     elif data == "add_account":
         await start_add_account(query, context)
     elif data.startswith("account_"):
@@ -303,47 +359,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Tambahan: Update fungsi back_to_main_menu untuk refresh data yang benar
 async def back_to_main_menu(query, context):
     """Kembali ke main menu dengan data terbaru"""
-    # Clear semua session data
+    # Clear semua session data kecuali pagination
+    current_page = context.user_data.get('account_page', 0)
     context.user_data.clear()
+    context.user_data['account_page'] = current_page
+    context.user_data['current_user_id'] = query.from_user.id
     
     # Reload data dari file untuk memastikan data terbaru
     tg_manager.load_data()
     
-    total_accounts = len(tg_manager.accounts)
-    
-    if total_accounts == 0:
-        text = "🏠 *Dashboard Bot Manager*\n\n"
-        text += "📱 Total Akun: 0\n\n"
-        text += "Belum ada akun yang terdaftar nih!"
-        
-        keyboard = [[InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")]]
-    else:
-        text = f"🏠 *Dashboard Bot Manager*\n\n"
-        text += f"📱 Total Akun: {total_accounts}\n\n"
-        text += "*Pilih akun untuk dikelola:*"
-        
-        keyboard = []
-        # Pastikan hanya akun yang masih ada yang ditampilkan
-        for phone, data in tg_manager.accounts.items():
-            name = data.get('name', phone)
-            keyboard.append([InlineKeyboardButton(f"📞 {phone}", callback_data=f"account_{phone}")])
-        
-        keyboard.append([InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")])
-    
-    # Tambah tombol admin jika main admin
-    user_id = query.from_user.id if hasattr(query, 'from_user') else None
-    if user_id and tg_manager.is_main_admin(user_id):
-        keyboard.append([InlineKeyboardButton("👑 Panel Admin", callback_data="list_admin")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     try:
-        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        await show_accounts_page(query.edit_message_text, context, current_page)
     except Exception as e:
         logger.error(f"Error updating main menu: {e}")
         # Fallback jika edit gagal
         try:
-            await query.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+            await show_accounts_page(query.message.reply_text, context, current_page)
         except Exception as e2:
             logger.error(f"Error sending new message: {e2}")
 
@@ -509,7 +540,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['last_contact_time'] = current_time
 
 async def process_add_contacts(query, context, phone):
-    """Tambah semua kontak + verifikasi save via ImportContactsRequest"""
+    """Tambah semua kontak + wajib verifikasi save sebelum hitung sukses"""
     contacts_to_add = context.user_data.get('contacts_to_add', [])
 
     if not contacts_to_add:
@@ -540,10 +571,12 @@ async def process_add_contacts(query, context, phone):
             last_name = contact_info.get('last_name') or ""
             full_name = f"{first_name} {last_name}".strip()
 
-            status, reason = "", None
+            status = ""
+            reason = None
 
             try:
-                result = await client(functions.contacts.ImportContactsRequest(
+                # import kontak
+                await client(functions.contacts.ImportContactsRequest(
                     contacts=[types.InputPhoneContact(
                         client_id=idx,
                         phone=phone_num,
@@ -552,17 +585,16 @@ async def process_add_contacts(query, context, phone):
                     )]
                 ))
 
-                if result.imported:
+                # verifikasi apakah tersimpan
+                all_contacts = await client(functions.contacts.GetContactsRequest(hash=0))
+                saved_numbers = [str(u.phone) for u in all_contacts.users if u.phone]
+
+                if phone_num in saved_numbers:
                     success_count += 1
                     status = "✅ Berhasil & Terverifikasi"
-                elif result.retry_contacts:
-                    failed_count += 1
-                    reason = "Butuh retry (rate limit/teknis)"
-                    failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
-                    status = f"❌ Gagal ({reason})"
                 else:
                     failed_count += 1
-                    reason = "Tidak ada di hasil imported (gagal save)"
+                    reason = "Tidak muncul di daftar kontak (gagal save)"
                     failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
                     status = f"❌ Gagal ({reason})"
 
@@ -582,7 +614,7 @@ async def process_add_contacts(query, context, phone):
                 failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
                 status = f"❌ Gagal ({reason})"
 
-            # update progress tiap kontak
+            # update pesan progress tiap 1 kontak
             progress_text = (
                 f"📞 Kontak {idx}/{total_contacts}\n"
                 f"👤 {full_name} ({phone_num})\n"
