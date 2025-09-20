@@ -509,7 +509,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['last_contact_time'] = current_time
 
 async def process_add_contacts(query, context, phone):
-    """Tambah semua kontak + wajib verifikasi save sebelum hitung sukses"""
+    """Tambah semua kontak + verifikasi save via ImportContactsRequest"""
     contacts_to_add = context.user_data.get('contacts_to_add', [])
 
     if not contacts_to_add:
@@ -540,12 +540,10 @@ async def process_add_contacts(query, context, phone):
             last_name = contact_info.get('last_name') or ""
             full_name = f"{first_name} {last_name}".strip()
 
-            status = ""
-            reason = None
+            status, reason = "", None
 
             try:
-                # import kontak
-                await client(functions.contacts.ImportContactsRequest(
+                result = await client(functions.contacts.ImportContactsRequest(
                     contacts=[types.InputPhoneContact(
                         client_id=idx,
                         phone=phone_num,
@@ -554,16 +552,17 @@ async def process_add_contacts(query, context, phone):
                     )]
                 ))
 
-                # verifikasi apakah tersimpan
-                all_contacts = await client(functions.contacts.GetContactsRequest(hash=0))
-                saved_numbers = [str(u.phone) for u in all_contacts.users if u.phone]
-
-                if phone_num in saved_numbers:
+                if result.imported:
                     success_count += 1
                     status = "✅ Berhasil & Terverifikasi"
+                elif result.retry_contacts:
+                    failed_count += 1
+                    reason = "Butuh retry (rate limit/teknis)"
+                    failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
+                    status = f"❌ Gagal ({reason})"
                 else:
                     failed_count += 1
-                    reason = "Tidak muncul di daftar kontak (gagal save)"
+                    reason = "Tidak ada di hasil imported (gagal save)"
                     failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
                     status = f"❌ Gagal ({reason})"
 
@@ -583,7 +582,7 @@ async def process_add_contacts(query, context, phone):
                 failed_details.append(f"• {full_name} ({phone_num}) - {reason}")
                 status = f"❌ Gagal ({reason})"
 
-            # update pesan progress tiap 1 kontak
+            # update progress tiap kontak
             progress_text = (
                 f"📞 Kontak {idx}/{total_contacts}\n"
                 f"👤 {full_name} ({phone_num})\n"
