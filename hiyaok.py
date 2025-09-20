@@ -200,7 +200,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
         for phone, data in tg_manager.accounts.items():
             name = data.get('name', phone)
-            keyboard.append([InlineKeyboardButton(f"📞 {name}", callback_data=f"account_{phone}")])
+            keyboard.append([InlineKeyboardButton(f"📞 {phone}", callback_data=f"account_{phone}")])
         
         keyboard.append([InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")])
     
@@ -326,7 +326,7 @@ async def back_to_main_menu(query, context):
         # Pastikan hanya akun yang masih ada yang ditampilkan
         for phone, data in tg_manager.accounts.items():
             name = data.get('name', phone)
-            keyboard.append([InlineKeyboardButton(f"📞 {name}", callback_data=f"account_{phone}")])
+            keyboard.append([InlineKeyboardButton(f"📞 {phone}", callback_data=f"account_{phone}")])
         
         keyboard.append([InlineKeyboardButton("➕ Tambah Akun", callback_data="add_account")])
     
